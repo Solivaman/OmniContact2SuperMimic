@@ -19,7 +19,15 @@ import torch
 import warp as wp
 
 from .data import generate_clip, load_demo
-from .sim import CarryEnv, _generator, _matrix, _scene
+from .sim import (
+    CarryEnv,
+    FALL_HEIGHT_ERR_M,
+    FALL_MIN_HEIGHT_M,
+    FALL_TILT_ERR,
+    _generator,
+    _matrix,
+    _scene,
+)
 
 
 _UNSET = object()
@@ -84,8 +92,11 @@ def _pd_ctrl(target: wp.array2d[float], qpos: wp.array2d[float], qvel: wp.array2
 
 
 def finish_step_gpu(state, contacts, support, initial_box, goal, goal_on_floor,
-                    env_index, clip_len, lifted, carried_steps, lost_steps, stable_steps):
+                    env_index, clip_len, lifted, carried_steps, lost_steps, stable_steps,
+                    ref_z=None, ref_r22=None):
     """Vectorized torch equivalent of CarryEnv._finish_step across all parallel worlds."""
+    if ref_z is None or ref_r22 is None:
+        raise ValueError("finish_step_gpu requires ref_z and ref_r22")
     zero_i = env_index.new_zeros(())
     next_index = torch.minimum(env_index + 1, clip_len - 1)
     ground = support[:, 0]
@@ -112,7 +123,11 @@ def finish_step_gpu(state, contacts, support, initial_box, goal, goal_on_floor,
     q = state[:, 3:7]
     q_norm = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
     r22 = 1.0 - 2.0 * (q_norm[:, 1].square() + q_norm[:, 2].square())
-    fallen = (state[:, 2] < 0.3) | (r22 < 0.35)
+    fallen = (
+        (state[:, 2] < FALL_MIN_HEIGHT_M)
+        | ((state[:, 2] - ref_z).abs() > FALL_HEIGHT_ERR_M)
+        | ((r22 - ref_r22).abs() > FALL_TILT_ERR)
+    )
     timeout = (next_index == (clip_len - 1)) & ~(fallen | drop | success)
     done = drop | fallen | timeout | success
     return (next_index, next_lifted, next_carried, next_lost, next_stable,
@@ -576,11 +591,18 @@ class WarpCarryWorlds:
                     self.envs[i]._update_teacher_history()
 
     def _read_teacher_pose(self, ids):
-        pos = self.d.xpos.numpy()
-        mat = self.d.xmat.numpy().reshape(self.num_envs, self._host.nbody, 9)
-        for i in ids:
-            self.envs[i].d.xpos[:] = pos[i]
-            self.envs[i].d.xmat[:] = mat[i]
+        idx = list(ids)
+        if not idx:
+            return
+        try:
+            pos = wp.to_torch(self.d.xpos)[idx].detach().cpu().numpy()
+            mat = wp.to_torch(self.d.xmat)[idx].detach().cpu().numpy().reshape(len(idx), self._host.nbody, 9)
+        except Exception:
+            pos = self.d.xpos.numpy()[idx]
+            mat = self.d.xmat.numpy()[idx].reshape(len(idx), self._host.nbody, 9)
+        for k, i in enumerate(idx):
+            self.envs[i].d.xpos[:] = pos[k]
+            self.envs[i].d.xmat[:] = mat[k]
 
     def _check_buffers(self):
         wp.launch(_check_capacity, self.num_envs,
@@ -641,18 +663,31 @@ class WarpCarryWorlds:
                 torch_stream.wait_stream(self._cuda_stream)
         return actions
 
-    def _eval_gpu_step(self):
+    def _eval_gpu_step(self, next_ref=None):
         contacts = (self._forces_torch.norm(dim=2) > self._contact_thresh).to(torch.float32)
         support = self._support_torch != 0
         states = torch.cat((
             self._qpos[:, :36], self._qvel[:, :35],
             self._qpos[:, self._bp:self._bp + 7], self._qvel[:, self._bv:self._bv + 6],
         ), dim=-1)
+        if next_ref is not None:
+            ref_pose = next_ref[:, 99:104]
+        else:
+            next_idx = np.minimum(
+                self._env_index.detach().cpu().numpy() + 1,
+                self._clip_len.detach().cpu().numpy() - 1,
+            )
+            ref_rows = np.stack([self.envs[i].clip[int(next_idx[i]), 99:104] for i in range(self.num_envs)])
+            ref_pose = torch.as_tensor(ref_rows, dtype=torch.float32, device=self.device)
+        ref_z = ref_pose[:, 0]
+        ref_q = ref_pose[:, 1:5]
+        ref_q_norm = ref_q / ref_q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        ref_r22 = 1.0 - 2.0 * (ref_q_norm[:, 1].square() + ref_q_norm[:, 2].square())
         (next_index, next_lifted, next_carried, next_lost, next_stable,
          done, success, drop, timeout, fallen, err) = finish_step_gpu(
             states, contacts, support, self._initial_box, self._goal_gpu, self._goal_on_floor,
             self._env_index, self._clip_len, self._lifted, self._carried_steps,
-            self._lost_steps, self._stable_steps,
+            self._lost_steps, self._stable_steps, ref_z=ref_z, ref_r22=ref_r22,
         )
         self._env_index.copy_(next_index)
         self._lifted.copy_(next_lifted)
@@ -661,11 +696,11 @@ class WarpCarryWorlds:
         self._stable_steps.copy_(next_stable)
         return states, contacts, support, done, success, drop, timeout, fallen, err
 
-    def step_gpu(self, actions):
+    def step_gpu(self, actions, *, next_ref=None, teacher_ids=None):
         """Advance all worlds on GPU and transfer only compact termination flags to host."""
         with torch.no_grad():
-            self._step_physics(actions)
-            states, contacts, _, done, success, drop, timeout, fallen, _ = self._eval_gpu_step()
+            actions_t = self._step_physics(actions)
+            states, contacts, _, done, success, drop, timeout, fallen, _ = self._eval_gpu_step(next_ref=next_ref)
             overflow_any = (self._overflow_torch != 0).any()
             non_finite = (~torch.isfinite(self._qpos).all()) | (~torch.isfinite(self._qvel).all())
             n = self.num_envs
@@ -687,6 +722,7 @@ class WarpCarryWorlds:
         if packed_np[n, 1]:
             raise FloatingPointError("Non-finite MuJoCo Warp physics state")
 
+        teacher_set = set(map(int, teacher_ids)) if teacher_ids is not None else set()
         flags_np = packed_np[:n]
         done_np = flags_np[:, 0].astype(bool)
         done_ids = np.flatnonzero(done_np)
@@ -703,20 +739,25 @@ class WarpCarryWorlds:
             e.pending_recovery = is_drop and not is_fallen and e.source != "recovery"
             if e.pending_recovery:
                 rec_ids.append(i)
-            src = e.source
+            src = f"teacher_{e.source}" if i in teacher_set else e.source
             event_counts[f"{src}/done"] += 1
             event_counts[f"{src}/success"] += int(is_success)
             event_counts[f"{src}/drop"] += int(is_drop)
             event_counts[f"{src}/timeout"] += int(is_timeout)
             event_counts[f"{src}/fallen"] += int(is_fallen)
-            event_counts[f"{src}/recovered"] += int(is_success and src == "recovery")
+            event_counts[f"{src}/recovered"] += int(is_success and e.source == "recovery")
         if rec_ids:
             self._sync_worlds_to_host(rec_ids)
         if self.teacher_history:
-            self._sync_worlds_to_host(range(self.num_envs))
-            self._read_teacher_pose(range(self.num_envs))
-            for e in self.envs:
-                e._update_teacher_history()
+            sync_ids = sorted(teacher_set) if teacher_ids is not None else list(range(self.num_envs))
+            if sync_ids:
+                act_np = actions_t[sync_ids].detach().cpu().numpy()
+                for k, i in enumerate(sync_ids):
+                    self.envs[i].last_action = act_np[k].copy()
+                self._sync_worlds_to_host(sync_ids)
+                self._read_teacher_pose(sync_ids)
+                for i in sync_ids:
+                    self.envs[i]._update_teacher_history()
         return states, contacts, done_np, event_counts, drops
 
     def step(self, actions):

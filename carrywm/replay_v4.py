@@ -1,5 +1,7 @@
 """Uniform GPU/CPU replay of real transitions and flat reference bank."""
 import hashlib
+from types import SimpleNamespace
+
 import numpy as np
 import torch
 
@@ -276,6 +278,7 @@ class VectorReplay:
         self.frames = torch.zeros(shape, dtype=torch.int32, device=self.device)
         self.episode_start = torch.zeros(shape, dtype=torch.int64, device=self.device)
         self.clip_ids = torch.zeros(shape, dtype=torch.int64, device=self.device)
+        self.is_teacher = torch.zeros(shape, dtype=torch.bool, device=self.device)
         self._hist_offsets = torch.arange(9, -1, -1, dtype=torch.int64, device=self.device)
         self._actor_offsets = torch.arange(83, dtype=torch.int64, device=self.device)
         self._saved_cuda_gen_state = None
@@ -324,8 +327,10 @@ class VectorReplay:
             arr = arr.copy()
         return torch.as_tensor(arr, dtype=dtype, device=self.device)
 
-    def append(self, state, after, previous, actions, contacts, contexts, obs, frames, clips, fresh):
+    def append(self, state, after, previous, actions, contacts, contexts, obs, frames, clips, fresh,
+               is_teacher=None):
         clip_ids = self.register_clips(clips, static=False)
+        teacher_t = None if is_teacher is None else self._to_device(is_teacher, torch.bool)
         self.append_gpu(
             self._to_device(state, torch.float32),
             self._to_device(after, torch.float32),
@@ -337,9 +342,11 @@ class VectorReplay:
             self._to_device(frames, torch.int32),
             clip_ids,
             self._to_device(fresh, torch.bool),
+            is_teacher=teacher_t,
         )
 
-    def append_gpu(self, state, after, previous, actions, contacts, contexts, obs, frames, clip_ids, fresh):
+    def append_gpu(self, state, after, previous, actions, contacts, contexts, obs, frames, clip_ids, fresh,
+                   is_teacher=None):
         tick = self.ticks
         row = tick % self.rows
         if self._restart:
@@ -350,6 +357,10 @@ class VectorReplay:
         self.episode_start[row] = self._first
         self.frames[row] = frames
         self.clip_ids[row] = clip_ids
+        if is_teacher is None:
+            self.is_teacher[row] = False
+        else:
+            self.is_teacher[row] = is_teacher
         self.states[row] = state
         self.after[row] = after
         self.previous[row] = previous
@@ -422,6 +433,30 @@ class VectorReplay:
         return (self.states[row, world], self.previous[row, world], self.contexts[row, world],
                 history, raw, remaining)
 
+    def teacher_batch(self, batch, offsets):
+        start = max(0, self.ticks - self.rows)
+        if self.ticks <= start:
+            return None
+        ticks = torch.arange(start, self.ticks, dtype=torch.int64, device=self.device)
+        valid_t = self.is_teacher[ticks % self.rows]
+        flat = torch.nonzero(valid_t.reshape(-1), as_tuple=True)[0]
+        n = int(flat.numel())
+        if n == 0:
+            return None
+        idx = torch.randint(n, (batch,), device=self.device, generator=self._gen)
+        chosen = flat[idx]
+        tick = (chosen // self.num_envs) + start
+        world = chosen % self.num_envs
+        row = tick % self.rows
+        history_ticks = torch.maximum(
+            tick[:, None] - self._hist_offsets[None, :],
+            self.episode_start[row, world][:, None],
+        )
+        history = self.observations[history_ticks % len(self.observations), world[:, None]]
+        offsets_t = torch.as_tensor(offsets, dtype=torch.int64, device=self.device)
+        raw_win = self.clip_bank.gather(self.clip_ids[row, world], self.frames[row, world], offsets_t)
+        return self.states[row, world], history, raw_win, self.actions[row, world]
+
     def to(self, device):
         target = torch.device(device)
         if target.type == "cuda" and target.index is None:
@@ -431,7 +466,7 @@ class VectorReplay:
         self.device = target
         for attr in ("_first", "states", "after", "actions", "previous", "contacts",
                      "contexts", "observations", "frames", "episode_start", "clip_ids",
-                     "_hist_offsets", "_actor_offsets"):
+                     "is_teacher", "_hist_offsets", "_actor_offsets"):
             setattr(self, attr, getattr(self, attr).to(target))
         self.clip_bank.to(target)
         self._windows = {k: v.to(target) for k, v in self._windows.items()}
@@ -471,7 +506,7 @@ class VectorReplay:
         snap.clip_bank = self.clip_bank.snapshot_cpu()
         for attr in ("_first", "states", "after", "actions", "previous", "contacts",
                      "contexts", "observations", "frames", "episode_start", "clip_ids",
-                     "_hist_offsets", "_actor_offsets"):
+                     "is_teacher", "_hist_offsets", "_actor_offsets"):
             setattr(snap, attr, getattr(self, attr).detach().cpu().clone())
         return snap
 
@@ -505,14 +540,19 @@ class VectorReplay:
             "frames": snap.frames,
             "episode_start": snap.episode_start,
             "clip_ids": snap.clip_ids,
+            "is_teacher": snap.is_teacher,
         }
 
     def __setstate__(self, state):
+        if "clip_bank" not in state:
+            converted = type(self).from_legacy(SimpleNamespace(**state), device="cpu")
+            self.__dict__.update(converted.__dict__)
+            return
         self.device = torch.device("cpu")
         self.num_envs = state["num_envs"]
         self.rows = state["rows"]
         self.capacity = state["capacity"]
-        self.seed = state["seed"]
+        self.seed = state.get("seed", 0)
         self.rng = np.random.default_rng()
         self.rng.bit_generator.state = state["rng_state"]
         if state.get("gen_device", "cpu") == "cuda":
@@ -531,6 +571,9 @@ class VectorReplay:
         for attr in ("states", "after", "actions", "previous", "contacts", "contexts",
                      "observations", "frames", "episode_start", "clip_ids"):
             setattr(self, attr, state[attr])
+        self.is_teacher = state.get(
+            "is_teacher", torch.zeros((self.rows, self.num_envs), dtype=torch.bool)
+        )
         self._hist_offsets = torch.arange(9, -1, -1, dtype=torch.int64)
         self._actor_offsets = torch.arange(83, dtype=torch.int64)
 
@@ -548,6 +591,8 @@ class VectorReplay:
         for attr in ("states", "after", "actions", "previous", "contacts",
                      "contexts", "observations", "frames", "episode_start"):
             getattr(rep, attr).copy_(torch.as_tensor(getattr(old, attr)))
+        if hasattr(old, "is_teacher"):
+            rep.is_teacher.copy_(torch.as_tensor(old.is_teacher, dtype=torch.bool))
         populated = min(rep.ticks, rep.rows)
         for r in range(populated):
             row_clips = old.clips[r]

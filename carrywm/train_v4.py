@@ -16,6 +16,7 @@ import torch
 from . import train as base
 from . import train_v3
 from .v3 import LearnerV3
+from .v6 import teacher_schedule
 
 NUM_ENVS = 1024
 ACTOR_BATCH = 2048
@@ -129,8 +130,11 @@ def check_resume(ck, args, version):
     if ck['iteration'] >= args.iterations:
         raise ValueError('--iterations must exceed the saved iteration')
     keys = ('num_envs', 'capacity', 'cfgen_ratio', 'action_noise', 'goal_mode', 'seed')
-    if version == 5:
+    if version in (5, 6):
         keys += ('termination_height_m', 'termination_gravity_z', 'termination_softness', 'critic_value_max', 'drop_penalty')
+    if version == 6:
+        keys += ('balance_reward_weight', 'action_rate_weight', 'action_l2_weight', 'obs_noise_scale',
+                 'critic_norm', 'teacher_init_fraction', 'teacher_decay_iters', 'teacher_bc_weight')
     for key in keys:
         if ck['config'][key] != getattr(args, key):
             raise ValueError(f'--resume requires the saved {key} value')
@@ -184,10 +188,15 @@ def _run(args, version, learner_type):
 
     # Recreate physical environments on restart. A fresh segment in every world
     # prevents a sampled WM sequence from straddling the restart boundary.
+    teacher_init = float(getattr(args, 'teacher_init_fraction', 0.0))
+    teacher_decay = int(getattr(args, 'teacher_decay_iters', 0))
+    teacher_bc_weight = float(getattr(args, 'teacher_bc_weight', 0.0))
+    teacher_bc_batch = int(getattr(args, 'teacher_bc_batch', 1024))
     env = WarpCarryWorlds(
         args.sim_root, args.motion_dir, num_envs=args.num_envs,
         seed=args.seed + old_ticks, device=device, cfgen_ratio=args.cfgen_ratio,
         cfgen_cache_dir=args.cfgen_cache_dir, use_cuda_graph=args.cuda_graph,
+        teacher_history=(teacher_init > 0.0 and first <= teacher_decay),
     )
     collector = VectorCollector(env, net, replay, rng)
     collector.episodes.update(episodes)
@@ -227,11 +236,11 @@ def _run(args, version, learner_type):
     def save(iteration):
         checkpointer.save(lambda: make_payload(iteration), output / 'latest.pt')
 
-    def warmup(minimum, *, update_normalizers, reason):
+    def warmup(minimum, *, update_normalizers, reason, episode_teacher_frac=0.0):
         initial_steps = collector.steps
         while collector.steps - initial_steps < minimum or not replay.has_window(base.WM_STEPS):
             collector.one_tick(noise=args.action_noise, update_normalizers=update_normalizers,
-                               defer_reward=True)
+                               defer_reward=True, episode_teacher_frac=episode_teacher_frac)
             if collector.steps - initial_steps >= max(args.capacity, minimum) and not replay.has_window(base.WM_STEPS):
                 raise RuntimeError('Warmup produced no continuous eight-step trajectory in any world')
         base.sync(device)
@@ -242,12 +251,20 @@ def _run(args, version, learner_type):
 
     try:
         if args.resume:
-            warmup(base.WM_STEPS * args.num_envs, update_normalizers=False, reason='new_physical_episodes_after_resume')
+            resume_teacher = teacher_schedule(first, teacher_init, teacher_decay)
+            warmup(base.WM_STEPS * args.num_envs, update_normalizers=False,
+                   reason='new_physical_episodes_after_resume', episode_teacher_frac=resume_teacher)
         else:
-            warmup(args.warmup_steps, update_normalizers=True, reason='initial_replay')
+            init_teacher = teacher_init if first <= teacher_decay else 0.0
+            warmup(args.warmup_steps, update_normalizers=True, reason='initial_replay',
+                   episode_teacher_frac=init_teacher)
 
         torch.cuda.reset_peak_memory_stats(device)
         for iteration in range(first, args.iterations + 1):
+            ep_teacher = teacher_schedule(iteration, teacher_init, teacher_decay)
+            bc_w = teacher_schedule(iteration, teacher_bc_weight, teacher_decay)
+            if env.teacher_history and ep_teacher <= 0.0:
+                env.teacher_history = False
             evaluate = args.eval_every and (iteration % args.eval_every == 0 or iteration == args.iterations)
             should_save = iteration in (first, args.iterations) or iteration % args.save_every == 0
             should_log = evaluate or iteration in (first, args.iterations) or iteration % args.log_every == 0
@@ -259,14 +276,16 @@ def _run(args, version, learner_type):
             updates = 0
             while not updates:
                 for key, value in collector.one_tick(
-                    noise=args.action_noise, defer_reward=not should_log
+                    noise=args.action_noise, defer_reward=not should_log,
+                    episode_teacher_frac=ep_teacher,
                 ).items():
                     totals[key] = totals.get(key, 0.) + value
                 updates = clock.tick()
                 if updates and not replay.has_window(base.WM_STEPS):
                     # Short episodes can evict every valid window. Don't count the
                     # extra collection as an update with replay ratio 16.
-                    warmup(base.WM_STEPS * args.num_envs, update_normalizers=False, reason='no_continuous_window')
+                    warmup(base.WM_STEPS * args.num_envs, update_normalizers=False,
+                           reason='no_continuous_window', episode_teacher_frac=ep_teacher)
                     before = collector.steps
                     totals.clear()
                     updates = 0
@@ -284,7 +303,10 @@ def _run(args, version, learner_type):
             if should_log:
                 base.sync(device)
             after_wm = time.monotonic()
-            stats.update(net.policy_update(replay, args.batch_size))
+            if bc_w > 0.0:
+                stats.update(net.policy_update(replay, args.batch_size, bc_weight=bc_w, bc_batch=teacher_bc_batch))
+            else:
+                stats.update(net.policy_update(replay, args.batch_size))
             if should_log:
                 base.sync(device)
             after_policy = time.monotonic()

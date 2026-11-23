@@ -14,6 +14,9 @@ from .data import OFFSETS, LAB2MJ, MJ2LAB, LINKS, generate_clip, load_demo, raw_
 
 
 DEFAULT_CFGEN_GOAL_NOISE_STD_M = 0.005
+FALL_MIN_HEIGHT_M = 0.15
+FALL_HEIGHT_ERR_M = 0.30
+FALL_TILT_ERR = 0.60
 
 
 def _matrix(quat):
@@ -322,7 +325,14 @@ class CarryEnv:
         off_table = ground and displacement[2] < -.08 and not hand
         lost_grasp = self._lost_steps >= 3 and (ground or origin or dest)
         drop = bool((off_table or lost_grasp) and (err >= .2 or not on_goal_support) and stable)
-        fallen = bool(state[2] < .3 or _matrix(state[3:7])[2,2] < .35)
+        ref = self.clip[self.index]
+        r22 = float(_matrix(state[3:7])[2, 2])
+        ref_r22 = float(_matrix(ref[100:104])[2, 2])
+        fallen = bool(
+            state[2] < FALL_MIN_HEIGHT_M
+            or abs(float(state[2]) - float(ref[99])) > FALL_HEIGHT_ERR_M
+            or abs(r22 - ref_r22) > FALL_TILT_ERR
+        )
         timeout = self.index == len(self.clip)-1 and not (fallen or drop or success)
         self._done = bool(drop or fallen or timeout or success)
         self.pending_recovery = drop and not fallen and self.source != "recovery"

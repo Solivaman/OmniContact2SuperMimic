@@ -123,15 +123,23 @@ class FinishStepEquivalenceTests(unittest.TestCase):
         return env
 
     def test_finish_step_gpu_matches_carry_env_across_all_event_branches(self):
-        n = 10
+        n = 11
         half = np.array([0.15, 0.15, 0.15], dtype=float)
         clip = np.zeros((40, 111), np.float32)
+        clip[:, 99] = 0.78
         clip[:, 100] = 1.0
         clip[:, 107] = 1.0
         tabletop = 0.75
         goals = [np.array([1.0, 0.0, 0.90], np.float32) for _ in range(n)]
         goals[4] = np.array([1.0, 0.0, 0.15], np.float32)  # World 4 targets floor
-        envs = [self._make_cpu_env(clip, goals[i], half, tabletop) for i in range(n)]
+        deep_bend_clip = clip.copy()
+        deep_bend_clip[:, 99] = 0.65
+        # q = [sqrt(0.45), sqrt(0.55), 0, 0] -> ref_r22 = 1 - 2*(0.55) = -0.10 (< 0.35 in legacy rule)
+        deep_bend_clip[:, 100:104] = np.array([np.sqrt(0.45), np.sqrt(0.55), 0.0, 0.0], np.float32)
+        envs = [
+            self._make_cpu_env(deep_bend_clip if i == 10 else clip, goals[i], half, tabletop)
+            for i in range(n)
+        ]
         for i in (3, 4, 6):
             envs[i]._lifted = True
         envs[5].index = 0
@@ -147,12 +155,18 @@ class FinishStepEquivalenceTests(unittest.TestCase):
         carried = torch.zeros(n, dtype=torch.int32)
         lost = torch.zeros(n, dtype=torch.int32)
         stable = torch.zeros(n, dtype=torch.int32)
+        ref_z = torch.full((n,), 0.78, dtype=torch.float32)
+        ref_z[10] = 0.65
+        ref_r22 = torch.ones(n, dtype=torch.float32)
+        ref_r22[10] = -0.10
 
-        # Simulate 6 steps covering lift, table/floor success, off_table drop, lost_grasp drop, falls, timeout
+        # Simulate 6 steps covering lift, table/floor success, off_table drop, lost_grasp drop, falls, timeout, deep bend
         for step in range(6):
             states = torch.zeros((n, 84), dtype=torch.float32)
             states[:, 2] = 0.78
             states[:, 3] = 1.0
+            states[10, 2] = 0.64
+            states[10, 3:7] = torch.tensor([np.sqrt(0.46), np.sqrt(0.54), 0.0, 0.0], dtype=torch.float32)
             states[:, 71:74] = torch.tensor([0., 0., 0.85])
             states[:, 74] = 1.0
             contacts = torch.zeros((n, 6), dtype=torch.float32)
@@ -172,17 +186,18 @@ class FinishStepEquivalenceTests(unittest.TestCase):
             support[5, 0] = True
             # World 6: lost_grasp drop on origin table after 3 lost steps -> drop at step 2
             support[6, 2] = True
-            # World 7: low pelvis fall
+            # World 7: low pelvis fall relative to ref_z=0.78
             if step == 1:
                 states[7, 2] = 0.25
-            # World 8: tilted unnormalized quaternion fall
+            # World 8: tilted unnormalized quaternion fall (|r22 - ref_r22| = 1.6 > 0.60)
             if step == 1:
-                states[8, 3:7] = torch.tensor([1.0, 2.0, 0.0, 0.0])  # normalized r22 = 1 - 2*(4/5) = -0.6 < 0.35
+                states[8, 3:7] = torch.tensor([1.0, 2.0, 0.0, 0.0])
 
             (env_index, lifted, carried, lost, stable,
              done, success, drop, timeout, fallen, err) = finish_step_gpu(
                 states, contacts, support, initial_box, goal_t, goal_on_floor,
                 env_index, clip_len, lifted, carried, lost, stable,
+                ref_z=ref_z, ref_r22=ref_r22,
             )
 
             act = np.zeros(29, np.float32)
@@ -203,6 +218,8 @@ class FinishStepEquivalenceTests(unittest.TestCase):
                 self.assertEqual(bool(lifted[i].item()), info["lifted"], f"step={step} world={i} lifted")
                 self.assertEqual(int(env_index[i].item()), e.index, f"step={step} world={i} index")
                 self.assertAlmostEqual(float(err[i].item()), info["goal_error"], places=5)
+        self.assertFalse(envs[10]._done)
+        self.assertTrue(envs[7]._done and envs[8]._done)
 
 
 class LearnerAndCheckpointerTests(unittest.TestCase):

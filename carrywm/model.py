@@ -136,12 +136,22 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, context_dim, hidden=(512, 256)):
+    def __init__(self, context_dim, hidden=(512, 256), normalize=False):
         super().__init__()
-        self.value = _mlp(STATE_DIM + 11*GOAL_DIM + context_dim, hidden, 1)
+        input_dim = STATE_DIM + 11 * GOAL_DIM + context_dim
+        self.inputs = RunningNorm(input_dim) if normalize else None
+        self.value = _mlp(input_dim, hidden, 1)
+
+    @torch.no_grad()
+    def update_stats(self, state, goal, ctx):
+        if self.inputs is not None:
+            self.inputs.update(torch.cat((state, goal.flatten(-2), ctx), -1))
 
     def forward(self, state, goal, ctx):
-        return self.value(torch.cat((state, goal.flatten(-2), ctx), -1)).squeeze(-1)
+        x = torch.cat((state, goal.flatten(-2), ctx), -1)
+        if self.inputs is not None:
+            x = self.inputs(x)
+        return self.value(x).squeeze(-1)
 
 
 class WorldModel(nn.Module):
@@ -210,8 +220,11 @@ class CarryGeometry(nn.Module):
               "left_shoulder_roll_link", "left_elbow_link", "left_palm_link",
               "right_shoulder_roll_link", "right_elbow_link", "right_palm_link")
 
-    def __init__(self, sim2sim_root):
+    def __init__(self, sim2sim_root, *, tracking_weights=None, action_rate_weight=-0.1, action_l2_weight=0.0):
         super().__init__()
+        self.tracking_weights = dict(TRACKING_REWARD_WEIGHTS if tracking_weights is None else tracking_weights)
+        self.action_rate_weight = float(action_rate_weight)
+        self.action_l2_weight = float(action_l2_weight)
         root = Path(sim2sim_root)
         with (root/"policy/omnicontact/config/OmniContact.yaml").open() as f:
             config = yaml.safe_load(f)
@@ -355,7 +368,7 @@ class CarryGeometry(nn.Module):
         feet = fk.index_select(-3,self.feet_ids)[..., :2,3]
         last_feet = prev_fk.index_select(-3,self.feet_ids)[..., :2,3]
         feet_speed = (feet-last_feet).norm(dim=-1)/DT
-        w = TRACKING_REWARD_WEIGHTS
+        w = self.tracking_weights
         terms = {
             "anchor_pos": w["anchor_pos"]*torch.exp(-(anchor-ref_anchor).square().sum(-1)/.3**2),
             "anchor_rot": w["anchor_rot"]*torch.exp(-_rotation_error(arot,ref_arot).square()/.4**2),
@@ -368,11 +381,13 @@ class CarryGeometry(nn.Module):
             "interaction_pos": w["interaction_pos"]*torch.exp(-grip_p_error*weight.square()/.3**2).mean(-1),
             "interaction_rot": w["interaction_rot"]*torch.exp(-(grip_angle-ref_grip_angle).square()*weight.square()/.3**2).mean(-1),
             "contact": w["contact"]*torch.exp(-(contacts[..., :4]-target[..., 35:39]).square().mean(-1)),
-            "action_rate": -.1*(action-prev_action).square().sum(-1),
+            "action_rate": self.action_rate_weight*(action-prev_action).square().sum(-1),
             "arm_torque": -.005*torque.index_select(-1,self.arm_ids).square().sum(-1),
             "joint_limit": -10.*limits.sum(-1),
             "foot_slip": -.1*(contacts[..., 4:]*feet_speed).sum(-1),
         }
+        if self.action_l2_weight != 0.0:
+            terms["action_l2"] = self.action_l2_weight * action.square().sum(-1)
         return {name: DT*value for name, value in terms.items()}
 
     def reward(self, *args, **kwargs):

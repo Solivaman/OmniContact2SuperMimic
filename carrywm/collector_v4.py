@@ -18,6 +18,7 @@ class VectorCollector:
         self.steps = 0
         self.episodes = Counter()
         self.fresh = np.ones(self.count, bool)
+        self.world_is_teacher = np.zeros(self.count, bool)
         self.hist = None
         replay.begin_new_episodes()
 
@@ -51,19 +52,31 @@ class VectorCollector:
             self.replay.register_clips(static_clips, static=True)
 
     @torch.no_grad()
-    def one_tick(self, teacher_prob=0., noise=0., update_normalizers=False, defer_reward=False):
+    def one_tick(self, teacher_prob=0., noise=0., update_normalizers=False, defer_reward=False,
+                 episode_teacher_frac=0.0):
         if self._gpu_fast:
-            return self._one_tick_gpu(teacher_prob, noise, update_normalizers, defer_reward)
+            return self._one_tick_gpu(
+                teacher_prob, noise, update_normalizers, defer_reward, episode_teacher_frac
+            )
         return self._one_tick_cpu(teacher_prob, noise, update_normalizers)
 
-    def _one_tick_gpu(self, teacher_prob, noise, update_normalizers, defer_reward):
+    def _one_tick_gpu(self, teacher_prob, noise, update_normalizers, defer_reward,
+                      episode_teacher_frac=0.0):
         envs, net = self.env.envs, self.net
         device = net.device
+        if episode_teacher_frac <= 0.0:
+            self.world_is_teacher.fill(False)
         ids = np.flatnonzero(self.fresh)
         if len(ids):
             self.env.reset(ids)
+            if episode_teacher_frac > 0.0:
+                k_teacher = int(round(episode_teacher_frac * self.count))
+                self.world_is_teacher[ids] = ids < k_teacher
+            else:
+                self.world_is_teacher[ids] = False
             for i in ids:
-                self.episodes[f"{envs[i].source}/started"] += 1
+                src = f"teacher_{envs[i].source}" if self.world_is_teacher[i] else envs[i].source
+                self.episodes[f"{src}/started"] += 1
             idx_t = torch.as_tensor(ids, dtype=torch.int64, device=device)
             self.state_gpu.index_copy_(0, idx_t, self.env._state_gpu.index_select(0, idx_t))
             self.context_gpu.index_copy_(0, idx_t, self.env._context_gpu.index_select(0, idx_t))
@@ -80,8 +93,17 @@ class VectorCollector:
         if self.hist is None:
             self.hist = torch.zeros((self.count, 10, 141), dtype=torch.float32, device=device)
 
-        teacher_frac = 0.0
-        if not update_normalizers and teacher_prob == 0 and hasattr(net, "collect_act"):
+        if episode_teacher_frac > 0.0 or self.world_is_teacher.any():
+            teacher_mask_np = self.world_is_teacher
+            teacher_ids = np.flatnonzero(teacher_mask_np)
+        elif teacher_prob > 0.0:
+            teacher_mask_np = self.rng.random(self.count) < teacher_prob
+            teacher_ids = np.flatnonzero(teacher_mask_np)
+        else:
+            teacher_mask_np = None
+            teacher_ids = np.empty(0, dtype=np.int64)
+
+        if not update_normalizers and hasattr(net, "collect_act"):
             obs, self.hist, actions = net.collect_act(
                 self.state_gpu, self.previous_gpu, self.context_gpu, raw_win, self.hist, fresh_t
             )
@@ -92,33 +114,47 @@ class VectorCollector:
             goal = net.reference(self.state_gpu, raw_win)
             with net.autocast():
                 actions = net.actor(goal, self.hist).float()
-            teacher_ids = np.flatnonzero(self.rng.random(self.count) < teacher_prob) if teacher_prob else ()
-            if len(teacher_ids):
-                teacher_frac = len(teacher_ids) / self.count
-                t_idx = torch.as_tensor(teacher_ids, dtype=torch.int64, device=device)
-                t_act = torch.as_tensor(
-                    np.stack([envs[i].teacher_action() for i in teacher_ids]),
-                    dtype=torch.float32, device=device,
-                )
-                actions.index_copy_(0, t_idx, t_act)
             if update_normalizers:
                 net.actor.update_stats(goal, self.hist)
+                if getattr(net, "critic", None) is not None and hasattr(net.critic, "update_stats"):
+                    net.critic.update_stats(self.state_gpu, goal, self.context_gpu)
 
+        teacher_mask_t = (
+            torch.as_tensor(teacher_mask_np, dtype=torch.bool, device=device)
+            if teacher_mask_np is not None else None
+        )
         if noise:
-            actions = actions + torch.randn(
+            eps = torch.randn(
                 actions.shape, generator=self._gpu_gen, device=device, dtype=torch.float32
             ) * noise
+            if teacher_mask_t is not None:
+                eps = eps.masked_fill(teacher_mask_t[:, None], 0.0)
+            actions = actions + eps
+
+        teacher_frac = 0.0
+        if len(teacher_ids):
+            teacher_frac = len(teacher_ids) / self.count
+            t_idx = torch.as_tensor(teacher_ids, dtype=torch.int64, device=device)
+            t_act = torch.as_tensor(
+                np.stack([envs[i].teacher_action() for i in teacher_ids]),
+                dtype=torch.float32, device=device,
+            )
+            actions.index_copy_(0, t_idx, t_act)
+
         actions = actions.clamp(-10.0, 10.0)
         if update_normalizers:
             net.wm.update_stats(self.state_gpu, actions, self.context_gpu)
 
-        after_gpu, contacts_gpu, done_np, event_counts, drops = self.env.step_gpu(actions)
+        target = self.replay.gather_reference(self.clip_ids_gpu, self.frames_gpu, self._one_offset_gpu)[:, 0]
+        after_gpu, contacts_gpu, done_np, event_counts, drops = self.env.step_gpu(
+            actions, next_ref=target, teacher_ids=teacher_ids if len(teacher_ids) else None
+        )
         self.episodes.update(event_counts)
         self.replay.append_gpu(
             self.state_gpu, after_gpu, self.previous_gpu, actions, contacts_gpu,
             self.context_gpu, obs, self.frames_gpu, self.clip_ids_gpu, fresh_t,
+            is_teacher=teacher_mask_t,
         )
-        target = self.replay.gather_reference(self.clip_ids_gpu, self.frames_gpu, self._one_offset_gpu)[:, 0]
         terms = net.geo.reward_terms(
             self.state_gpu, after_gpu, self.previous_gpu, actions, target, contacts_gpu
         )

@@ -26,6 +26,18 @@ WM_STEPS = 8
 HORIZON = 32
 GAMMA = 0.99
 LAMBDA = 0.95
+# Per-channel proprioception/box observation noise scales matching CarryGeometry.observation (141-dim).
+OBS_NOISE_BASE = (
+    (0.01,) * 15   # ee_local_pos (5 x 3)
+    + (0.15,) * 3  # root_ang_vel
+    + (0.03,) * 3  # projected_gravity
+    + (0.02,) * 29 # joint_pos
+    + (0.30,) * 29 # joint_vel
+    + (0.0,) * 29  # prev_action
+    + (0.01,) * 3  # rel_box_pos
+    + (0.02,) * 6  # rel_box_rot6d
+    + (0.01,) * 24 # local_box_corners (8 x 3)
+)
 
 
 def args_from_cli(argv=None, *, configure=None):
@@ -124,13 +136,23 @@ class Learner:
         self.args = args
         self.device = torch.device(args.device)
         self.offsets = torch.tensor(OFFSETS, device=self.device)
-        self.geo = CarryGeometry(args.sim_root).to(self.device)
+        self.geo = CarryGeometry(
+            args.sim_root,
+            tracking_weights=getattr(args, "tracking_weights", None),
+            action_rate_weight=getattr(args, "action_rate_weight", -0.1),
+            action_l2_weight=getattr(args, "action_l2_weight", 0.0),
+        ).to(self.device)
         self.actor = Actor(first_width=args.encoder_width, decoder_width=args.decoder_width).to(self.device)
         self.wm = WorldModel(context_dim, width=args.wm_width).to(self.device)
-        self.critic = Critic(context_dim).to(self.device)
+        self.critic = Critic(context_dim, normalize=getattr(args, "critic_norm", False)).to(self.device)
         self.models = [self.wm, self.actor, self.critic]
         adam_kw = {"fused": True} if self.device.type == "cuda" else {}
         self.optimizers = [torch.optim.Adam(m.parameters(), lr=args.lr, **adam_kw) for m in self.models]
+        obs_noise_scale = float(getattr(args, "obs_noise_scale", 0.0))
+        self._obs_noise_std = (
+            torch.tensor(OBS_NOISE_BASE, dtype=torch.float32, device=self.device) * obs_noise_scale
+            if obs_noise_scale > 0.0 else None
+        )
         self._step_offsets = torch.arange(1, HORIZON + 1, device=self.device)[:, None] + self.offsets[None, :]
         self._step_numbers = torch.arange(1, HORIZON + 1, dtype=torch.float32, device=self.device)
         self._compiled_wm_loss = self._wm_rollout_loss
@@ -225,7 +247,9 @@ class Learner:
         cont, within_boundary = self._continuation(after, target, task_alive)
         reward = reward - self.args.drop_penalty * dropped.float()
         obs = self.geo.observation(after, action, ctx, fk=next_fk)
-        next_hist = torch.cat([hist[:, 1:], obs[:, None]], dim=1)
+        noise_std = getattr(self, "_obs_noise_std", None)
+        obs_in = obs + torch.randn_like(obs) * noise_std if noise_std is not None else obs
+        next_hist = torch.cat([hist[:, 1:], obs_in[:, None]], dim=1)
         next_goal = self.reference(after, raw_next_win, fk=next_fk)
         return after, action, next_fk, next_goal, next_hist, reward, cont, within_boundary, slip_frames
 
@@ -239,6 +263,9 @@ class Learner:
         goal = self.reference(state, raw[:, self.offsets], fk=fk)
         if update_stats:
             self.actor.update_stats(goal.detach(), hist)
+        noise_std = getattr(self, "_obs_noise_std", None)
+        if noise_std is not None:
+            hist = hist + torch.randn_like(hist) * noise_std
         states, goals, rewards, continuations, valid_rows = [], [], [], [], []
         mask = torch.ones_like(remaining)
         in_episode = torch.ones_like(remaining, dtype=torch.bool)
@@ -458,6 +485,7 @@ def _eval_episode_worker(spec):
             np.asarray(seg.clip[indices], dtype=np.float32),
             np.asarray([x["done"] for x in seg.events], dtype=bool),
             seg.events,
+            len(seg.clip),
         ))
     return dict(collector.episodes), segments
 
@@ -516,19 +544,31 @@ def validate(net, args):
             indices = [*seg.frames, min(seg.frames[-1] + 1, len(seg.clip) - 1)]
             segments.append((
                 seg.source, seg.states, seg.actions, seg.context, seg.contacts,
-                seg.clip[indices], [x["done"] for x in seg.events], seg.events,
+                seg.clip[indices], [x["done"] for x in seg.events], seg.events, len(seg.clip),
             ))
 
     results = {f"eval/{k}": v for k, v in episodes.items()}
+    ep_groups = {}
+    for item in segments:
+        ep_groups.setdefault(item[0], []).append((item[7], item[8]))
     for source in ("npz", "cfgen", "recovery"):
         n = episodes[f"{source}/done"]
         if n:
-            for key in ("success", "drop"):
+            for key in ("success", "drop", "fallen"):
                 results[f"eval/{source}/{key}_rate"] = episodes[f"{source}/{key}"] / n
+        if source in ep_groups:
+            grp = ep_groups[source]
+            results[f"eval/{source}/mean_steps"] = float(np.mean([len(ev) for ev, _ in grp]))
+            results[f"eval/{source}/mean_survival_pct"] = float(np.mean([
+                100.0 * len(ev) / max(clen, 1) for ev, clen in grp
+            ]))
+            results[f"eval/{source}/lift_rate"] = float(np.mean([
+                any(x.get("lifted", False) for x in ev) for ev, _ in grp
+            ]))
     from .validation import validate_dynamics, aggregate_dynamics
     evaluated = []
     by_source = {}
-    for source, states, actions, context, contacts, targets, dones, events in segments:
+    for source, states, actions, context, contacts, targets, dones, events, _ in segments:
         args_wm = (states, actions, context, contacts, targets, dones)
         held = [tensor(np.asarray(x), net.device) for x in args_wm]
         held[-1] = held[-1].bool()

@@ -2,6 +2,7 @@
 from typing import NamedTuple
 
 import torch
+from torch.nn import functional as F
 
 from .train import HORIZON, Learner, frozen, lambda_returns, tensor
 
@@ -99,12 +100,15 @@ class LearnerV3(Learner):
         opt.zero_grad(set_to_none=True)
         return total.item() / CRITIC_EPOCHS
 
-    def policy_update(self, replay, batch_size):
+    def policy_update(self, replay, batch_size, *, bc_weight=0.0, bc_batch=1024):
         inputs = tuple(tensor(x, self.device) for x in replay.actor(batch_size, HORIZON))
-        state, _, _, history, raw, _ = inputs
+        state, _, ctx, history, raw, _ = inputs
         # Every trajectory in this logical batch uses the same normalization statistics.
         with torch.no_grad():
-            self.actor.update_stats(self.reference(state, raw[:, self.offsets]), history)
+            goal0 = self.reference(state, raw[:, self.offsets])
+            self.actor.update_stats(goal0, history)
+            if hasattr(self.critic, "update_stats"):
+                self.critic.update_stats(state, goal0, ctx)
         microbatch = min(self.args.actor_microbatch, batch_size)
         if microbatch < 1:
             raise ValueError("actor_microbatch must be positive")
@@ -129,17 +133,36 @@ class LearnerV3(Learner):
 
         # An OOM after an optimizer step must never retry the whole update.
         try:
+            bc_loss_val = 0.0
+            if bc_weight > 0.0 and hasattr(replay, "teacher_batch"):
+                t_batch = replay.teacher_batch(bc_batch, self.offsets)
+                if t_batch is not None:
+                    t_state, t_hist, t_raw, t_act = t_batch
+                    noise_std = getattr(self, "_obs_noise_std", None)
+                    if noise_std is not None:
+                        t_hist = t_hist + torch.randn_like(t_hist) * noise_std
+                    with torch.no_grad():
+                        t_goal = self.reference(t_state, t_raw)
+                    with self.autocast():
+                        pred_act = self.actor(t_goal, t_hist).float()
+                    bc_loss = F.mse_loss(pred_act, t_act.float().clamp(-10.0, 10.0))
+                    (float(bc_weight) * bc_loss).backward()
+                    bc_loss_val = float(bc_loss.detach().item())
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1., error_if_nonfinite=True)
             opt.step()
             opt.zero_grad(set_to_none=True)
             critic_loss = self._fit_critic(data)
         except torch.cuda.OutOfMemoryError as exc:
             raise RuntimeError("V3 optimizer update exhausted memory; resume the last checkpoint") from exc
-        return {"actor/return": mean_return.item(), "actor/alive32": survival.item(),
-                "actor/updates": 1, "actor/rollouts": batch_size,
-                "actor/microbatches": (batch_size + microbatch - 1) // microbatch,
-                "actor/microbatch_size": microbatch,
-                "actor/checkpoint_encoder": getattr(self.args, "checkpoint_encoder", False),
-                "critic/loss": critic_loss,
-                "critic/updates": CRITIC_EPOCHS * CRITIC_MINIBATCHES,
-                "critic/epochs": CRITIC_EPOCHS}
+        metrics = {"actor/return": mean_return.item(), "actor/alive32": survival.item(),
+                   "actor/updates": 1, "actor/rollouts": batch_size,
+                   "actor/microbatches": (batch_size + microbatch - 1) // microbatch,
+                   "actor/microbatch_size": microbatch,
+                   "actor/checkpoint_encoder": getattr(self.args, "checkpoint_encoder", False),
+                   "critic/loss": critic_loss,
+                   "critic/updates": CRITIC_EPOCHS * CRITIC_MINIBATCHES,
+                   "critic/epochs": CRITIC_EPOCHS}
+        if bc_weight > 0.0 or getattr(self.args, "teacher_bc_weight", 0.0) > 0.0:
+            metrics["actor/bc_loss"] = bc_loss_val
+            metrics["actor/bc_weight"] = float(bc_weight)
+        return metrics
