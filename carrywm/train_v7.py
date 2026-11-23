@@ -1,4 +1,6 @@
 """Learn carry-box control from simulated transitions and motion references."""
+import argparse
+
 from . import train_v4, train_v6
 from .v7 import LearnerV7
 
@@ -6,6 +8,14 @@ from .v7 import LearnerV7
 def configure(parser):
     train_v6.configure(parser)
     parser.description = __doc__
+    parser.add_argument("--clip-storage", choices=("hybrid", "device"), default="hybrid",
+                        help="Cache static clips on GPU and keep recovery frames in host RAM, or keep both on GPU")
+    parser.add_argument("--warp-headroom-mib", type=int, default=1536,
+                        help="Release unused PyTorch cache before collection when driver free memory falls below this size")
+    parser.add_argument("--gpu-recovery", action=argparse.BooleanOptionalAction, default=True,
+                        help="Batch online recovery reference kinematics on the simulation GPU")
+    parser.add_argument("--fused-rotations", action=argparse.BooleanOptionalAction, default=True,
+                        help="Fuse small rotation products in compiled V7 tracking geometry")
     parser.set_defaults(num_envs=2048, batch_size=2048, actor_microbatch=2048,
                         teacher_init_fraction=0., teacher_decay_iters=0, teacher_bc_weight=0.,
                         capacity=2_048_000, warmup_steps=16_384, collect_steps=3,
@@ -19,6 +29,8 @@ def args_from_cli(argv=None):
         raise ValueError("V7 uses its own actor from initialization and throughout collection and learning")
     if args.goal_mode != "full":
         raise ValueError("V7 requires full references with future box poses")
+    if args.warp_headroom_mib < 0:
+        raise ValueError("warp-headroom-mib must be nonnegative")
     return train_v6.configure_objective(args)
 
 

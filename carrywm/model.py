@@ -234,9 +234,10 @@ class CarryGeometry(nn.Module):
               "right_shoulder_roll_link", "right_elbow_link", "right_palm_link")
 
     def __init__(self, sim2sim_root, *, tracking_weights=None, action_rate_weight=-0.1,
-                 action_l2_weight=0.0, box_goal=False):
+                 action_l2_weight=0.0, box_goal=False, fused_rotations=False):
         super().__init__()
         self.box_goal = box_goal
+        self.fused_rotations = fused_rotations
         self.tracking_weights = dict(TRACKING_REWARD_WEIGHTS if tracking_weights is None else tracking_weights)
         self.action_rate_weight = float(action_rate_weight)
         self.action_l2_weight = float(action_l2_weight)
@@ -301,12 +302,36 @@ class CarryGeometry(nn.Module):
             self.register_buffer("pad_offsets", torch.tensor(palm_surface_offsets(root), dtype=torch.float32),
                                  persistent=False)
 
+    def _mm3(self, left, right):
+        if self.fused_rotations and torch.compiler.is_compiling():
+            return (left.unsqueeze(-1) * right.unsqueeze(-3)).sum(-2)
+        return left @ right
+
+    def _mv3(self, rotation, vector):
+        if self.fused_rotations and torch.compiler.is_compiling():
+            return (rotation * vector.unsqueeze(-2)).sum(-1)
+        return _apply(rotation, vector)
+
     def fk(self, root_pos, root_quat, joints):
         padded = F.pad(joints, (0,1))
         half = .5*padded.index_select(-1, self.hinge)
         moving = torch.cat((half.cos().unsqueeze(-1), half.sin().unsqueeze(-1)*self.axis), -1)
         local = quat_mul(self.rest_quat.expand_as(moving), moving)
         pos = self.offset.expand_as(local[..., :3])
+        if self.fused_rotations and torch.compiler.is_compiling():
+            # A rigid transform has a constant bottom row. Compose R and t
+            # separately to let Inductor fuse the tiny rotation products.
+            root_rot = quat_matrix(root_quat).unsqueeze(-3)
+            identity = torch.eye(3, dtype=root_rot.dtype, device=root_rot.device).expand_as(root_rot)
+            rotation = torch.cat((identity, root_rot, quat_matrix(local[..., 2:, :])), -3)
+            translation = torch.cat((torch.zeros_like(root_pos.unsqueeze(-2)), root_pos.unsqueeze(-2),
+                                     pos[..., 2:, :]), -2)
+            for level in range(self.jumps):
+                ancestors = getattr(self, f"ancestors_{level}")
+                parent = rotation.index_select(-3, ancestors)
+                translation = translation.index_select(-2, ancestors) + self._mv3(parent, translation)
+                rotation = self._mm3(parent, rotation)
+            return _homogeneous(rotation, translation)
         body_transforms = _homogeneous(quat_matrix(local[..., 2:, :]), pos[..., 2:, :])
         root = _homogeneous(quat_matrix(root_quat), root_pos).unsqueeze(-3)
         identity = torch.eye(4, device=root.device, dtype=root.dtype).expand_as(root)

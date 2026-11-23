@@ -152,6 +152,8 @@ class ClipBank:
                     arr_len = len(clip)
                     if self._used_frames + arr_len > len(self.frames_buf):
                         cached_active = active_ids_fn()
+                        # Earlier slots in this batch are not yet in the replay ring.
+                        cached_active.update(out)
                 slot = self.register(clip, static=static, active_ids=cached_active)
                 if cached_active is not None:
                     cached_active.add(slot)
@@ -168,6 +170,13 @@ class ClipBank:
 
     def remaining(self, clip_ids, frames):
         return (self.lengths[clip_ids] - 1 - frames.to(torch.int64)).clamp_min(0).float()
+
+    def storage_metrics(self):
+        size = self.frames_buf.nbytes
+        return {"replay/clip_frames_used": self._used_frames,
+                "replay/clip_frames_capacity": len(self.frames_buf),
+                "replay/clip_device_bytes": size if self.device.type == "cuda" else 0,
+                "replay/clip_host_bytes": size if self.device.type == "cpu" else 0}
 
     def _copy_state(self, target_device):
         clone = ClipBank.__new__(ClipBank)
@@ -238,6 +247,74 @@ class ClipBank:
         self._slot_ref = {}
 
 
+class HybridClipBank:
+    """Keep recovery frames in host RAM and cache static clips on the learner device.
+
+    The host bank owns the original slot IDs and checkpoint format. Its frame arena
+    may grow or compact without changing the static mirror or any replay entry.
+    """
+
+    def __init__(self, host, device):
+        self.host = host
+        self.device = torch.device(device)
+        self._static_starts = torch.empty(0, dtype=torch.int64)
+        self._static_frames = torch.empty((0, host.raw_dim), device=self.device)
+        self._cache_static_clips()
+
+    def _cache_static_clips(self):
+        slots = [slot for slot, fixed in enumerate(self.host._slot_static) if fixed]
+        starts = torch.full((len(self.host._slot_starts),), -1, dtype=torch.int64)
+        count = sum(self.host._slot_lengths[slot] for slot in slots)
+        frames = torch.empty((count, self.host.raw_dim), dtype=torch.float32, device=self.device)
+        position = 0
+        for slot in slots:
+            start, length = self.host._slot_starts[slot], self.host._slot_lengths[slot]
+            starts[slot] = position
+            frames[position:position + length].copy_(self.host.frames_buf[start:start + length])
+            position += length
+        self._static_starts, self._static_frames = starts, frames
+
+    def register_many(self, clips, *, static=False, active_ids_fn=None):
+        slots = self.host.register_many(clips, static=static, active_ids_fn=active_ids_fn)
+        if static and any(s >= len(self._static_starts) or self._static_starts[s].item() < 0 for s in slots):
+            self._cache_static_clips()
+        return slots
+
+    def gather(self, clip_ids, frames, offsets):
+        # Copy only two indices per world to the host to locate dynamic rows.
+        ids, times = torch.stack((clip_ids, frames), dim=0).to("cpu").unbind(0)
+        if not len(self._static_frames):
+            return self.host.gather(ids, times, offsets.cpu()).to(self.device)
+        positions = self._static_starts[ids.clamp_max(len(self._static_starts) - 1)]
+        positions.masked_fill_(ids >= len(self._static_starts), -1)
+        dynamic = torch.nonzero(positions < 0, as_tuple=True)[0]
+        if len(dynamic) == len(ids):
+            return self.host.gather(ids, times, offsets.cpu()).to(self.device)
+        # Static rows gather directly from the GPU. Mixed batches select a dummy
+        # row for recovery slots and overwrite them with the exact requested frames.
+        last = self.host.lengths[ids] - 1
+        last[dynamic] = 0
+        bases, last = torch.stack((positions.clamp_min(0), last)).to(self.device).unbind(0)
+        local = torch.minimum(frames[:, None].long() + offsets[None, :], last[:, None])
+        result = self._static_frames[bases[:, None] + local]
+        if len(dynamic):
+            recovery = self.host.gather(ids[dynamic], times[dynamic], offsets.cpu())
+            result.index_copy_(0, dynamic.to(self.device), recovery.to(self.device))
+        return result
+
+    def remaining(self, clip_ids, frames):
+        ids, times = torch.stack((clip_ids, frames), dim=0).to("cpu").unbind(0)
+        return self.host.remaining(ids, times).to(self.device)
+
+    def snapshot_cpu(self):
+        return self.host.snapshot_cpu()
+
+    def storage_metrics(self):
+        result = self.host.storage_metrics()
+        result["replay/clip_device_bytes"] = self._static_frames.nbytes if self.device.type == "cuda" else 0
+        return result
+
+
 class VectorReplay:
     """Time-major ring on GPU or CPU. A terminal transition retains its actual final state.
 
@@ -245,7 +322,7 @@ class VectorReplay:
     Raw reference clips live in ClipBank and are shared across all rows of each episode.
     """
 
-    def __init__(self, capacity, seed, num_envs, device="cpu"):
+    def __init__(self, capacity, seed, num_envs, device="cpu", *, hybrid_clips=False):
         if num_envs < 1 or capacity < num_envs:
             raise ValueError("Replay capacity must fit at least one complete vector tick")
         self.device = torch.device(device)
@@ -261,7 +338,8 @@ class VectorReplay:
         self._first = torch.zeros(num_envs, dtype=torch.int64, device=self.device)
         self._restart = True
         self._windows = {}
-        self.clip_bank = ClipBank(device=self.device)
+        self.clip_bank = (HybridClipBank(ClipBank(), self.device) if hybrid_clips
+                          else ClipBank(device=self.device))
 
         shape = (self.rows, num_envs)
 
@@ -457,10 +535,16 @@ class VectorReplay:
         raw_win = self.clip_bank.gather(self.clip_ids[row, world], self.frames[row, world], offsets_t)
         return self.states[row, world], history, raw_win, self.actions[row, world]
 
-    def to(self, device):
+    def to(self, device, *, hybrid_clips=False):
         target = torch.device(device)
         if target.type == "cuda" and target.index is None:
             target = torch.device("cuda", torch.cuda.current_device())
+        host = self.clip_bank.host if isinstance(self.clip_bank, HybridClipBank) else self.clip_bank
+        if hybrid_clips:
+            if not isinstance(self.clip_bank, HybridClipBank) or self.clip_bank.device != target:
+                self.clip_bank = HybridClipBank(host.to("cpu"), target)
+        else:
+            self.clip_bank = host.to(target)
         if target == self.device:
             return self
         self.device = target
@@ -468,7 +552,6 @@ class VectorReplay:
                      "contexts", "observations", "frames", "episode_start", "clip_ids",
                      "is_teacher", "_hist_offsets", "_actor_offsets"):
             setattr(self, attr, getattr(self, attr).to(target))
-        self.clip_bank.to(target)
         self._windows = {k: v.to(target) for k, v in self._windows.items()}
         saved = getattr(self, "_saved_cuda_gen_state", None)
         if target.type == "cuda" and saved is not None:
@@ -578,10 +661,10 @@ class VectorReplay:
         self._actor_offsets = torch.arange(83, dtype=torch.int64)
 
     @classmethod
-    def from_legacy(cls, old, device="cpu"):
+    def from_legacy(cls, old, device="cpu", *, hybrid_clips=False):
         """Convert an older NumPy-backed VectorReplay checkpoint to the GPU/CPU tensor layout."""
         if isinstance(old, cls):
-            return old.to(device)
+            return old.to(device, hybrid_clips=hybrid_clips)
         seed = int(old.rng.integers(0, 2**31 - 1))
         rep = cls(old.capacity, seed, old.num_envs, device="cpu")
         rep.rng.bit_generator.state = old.rng.bit_generator.state
@@ -600,4 +683,4 @@ class VectorReplay:
                 clip = row_clips[c]
                 if clip is not None:
                     rep.clip_ids[r, c] = rep.clip_bank.register(clip, static=False)
-        return rep.to(device)
+        return rep.to(device, hybrid_clips=hybrid_clips)

@@ -241,7 +241,9 @@ class CarryEnv:
                 twists = scene.frame_twists[self.index]
             elif self.index:
                 twists = catalogue.twists[self.index]
-        f = self.clip[self.index]
+        self._set_main_pose(self.clip[self.index], twists)
+
+    def _set_main_pose(self, f, twists):
         self.d.qpos[:7] = f[97:104]
         self.d.qpos[7:36] = f[39:68]
         self.d.qvel[:3] = twists[0]
@@ -312,7 +314,10 @@ class CarryEnv:
         self.started_holding = self._lifted
         self._lost_steps = self._stable_steps = 0
         self._carried_steps = 2 if self._lifted else 0
-        self._initial_box = (self.clip[0, 104:107] if self.start_index else self.state[71:74]).copy()
+        # For a deferred ordinary frame-zero reset the new box pose is still in the
+        # reference. Recovery at frame zero retains the current physical box.
+        deferred = getattr(self, "_defer_main_pose", False) and self.source != "recovery"
+        self._initial_box = (self.clip[0, 104:107] if self.start_index or deferred else self.state[71:74]).copy()
         self._teacher_hist = np.zeros((5,141), np.float32)
         self.last_action = np.zeros(29, np.float32)
         if not getattr(self, "v7", False):

@@ -293,10 +293,20 @@ class _Episode(CarryEnv):
             self.scenes[path] = super()._load_scene(path)
         return self.scenes[path]
 
+    _defer_main_pose = False
+
     def _bind_scene(self, half):
         self.half = np.asarray(half, dtype=float)
+        if self._defer_main_pose:
+            return
         self.d.qpos[:] = self.m.qpos0
         self.d.qvel.fill(0)
+
+    def _set_main_pose(self, frame, twists):
+        if self._defer_main_pose:
+            self._reset_pose = (frame, twists)
+        else:
+            super()._set_main_pose(frame, twists)
 
     def _forward_reset(self):
         # The owner writes all reset worlds together after references are initialized.
@@ -339,7 +349,7 @@ class WarpCarryWorlds:
     def __init__(self, sim_root, motion_dir, num_envs, seed=42, split="train", cfgen_ratio=.1,
                  cfgen_goal_noise_std_m=0., device="cuda:0", nconmax=64, njmax=256,
                  teacher_history=False, cfgen_cache_dir=None, plan_workers=None,
-                 recovery_workers=None, use_cuda_graph=True, v7=False):
+                 recovery_workers=None, use_cuda_graph=True, v7=False, gpu_recovery=False):
         if num_envs < 1 or nconmax < 1 or njmax < 1:
             raise ValueError("World count and contact/constraint capacities must be positive")
         self.num_envs = num_envs
@@ -348,6 +358,11 @@ class WarpCarryWorlds:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.teacher_history = teacher_history
         self._use_cuda_graph = bool(use_cuda_graph) and self.device.type == "cuda"
+        self._batch_reset = v7 and self.device.type == "cuda" and not teacher_history
+        self._gpu_recovery = bool(gpu_recovery and v7 and self.device.type == "cuda")
+        self._recovery_fk = None
+        self._reset_geometry_slots = {}
+        self._reset_geometry_table = {}
         self._step_graph = None
         self._graph_warmed = False
         self._graph_failed = False
@@ -530,10 +545,12 @@ class WarpCarryWorlds:
         e = self.envs[i]
         # The process pool serializes arguments on a background thread. Take
         # private copies before the host arrays can be reused by any reset.
-        return self._ensure_rec_pool().submit(
-            _recovery_worker, str(e.root), e.d.qpos[:7].copy(), e.d.qpos[e.bp:e.bp + 7].copy(),
-            e.half.copy(), e.goal.copy(), e.v7,
-        )
+        args = (str(e.root), e.d.qpos[:7].copy(), e.d.qpos[e.bp:e.bp + 7].copy(),
+                e.half.copy(), e.goal.copy())
+        if self._gpu_recovery:
+            from .recovery_gpu import prepare_recovery
+            return self._ensure_rec_pool().submit(prepare_recovery, *args)
+        return self._ensure_rec_pool().submit(_recovery_worker, *args, e.v7)
 
     def _recovery_result(self, future):
         if not self.v7 or future.done():
@@ -559,7 +576,7 @@ class WarpCarryWorlds:
                 del futures[i]
             elif attempt and e._precomputed_recovery is _UNSET:
                 missing.append(i)
-            if not attempt and futures is not None:
+            if not attempt and (futures is not None or self._gpu_recovery):
                 # A caller can explicitly switch sources after an interrupted
                 # reset. Never reuse a ready plan from the abandoned episode.
                 e._precomputed_recovery = _UNSET
@@ -576,9 +593,27 @@ class WarpCarryWorlds:
             try:
                 for i in missing:
                     e = self.envs[i]
-                    e._precomputed_recovery = (e.clip, e.phase) if e._try_recovery() else None
+                    if self._gpu_recovery:
+                        from .recovery_gpu import prepare_recovery
+                        e._precomputed_recovery = prepare_recovery(
+                            e.root, e.d.qpos[:7], e.d.qpos[e.bp:e.bp + 7], e.half, e.goal)
+                    else:
+                        e._precomputed_recovery = (e.clip, e.phase) if e._try_recovery() else None
             finally:
                 self.last_recovery_wait_sec += perf_counter() - start
+        if self._gpu_recovery and source is None:
+            from .recovery_gpu import BatchedRecoveryFK, RecoverySkeleton
+            # A fallback CPU tuple and a rejected None are already complete.
+            # Consume only this reset's eligible worlds, retaining the requested order.
+            accepted = [self.envs[i] for i in ids if self.envs[i].pending_recovery and
+                        isinstance(self.envs[i]._precomputed_recovery, RecoverySkeleton)]
+            if accepted:
+                if self._recovery_fk is None:
+                    self._recovery_fk = BatchedRecoveryFK(accepted[0].root, self.device)
+                self._recovery_fk.complete([e._precomputed_recovery for e in accepted])
+                for e in accepted:
+                    plan = e._precomputed_recovery
+                    e._precomputed_recovery = (plan.frames, plan.phase)
 
     def reset(self, ids, source=None):
         if self.v7:
@@ -590,6 +625,9 @@ class WarpCarryWorlds:
             raise ValueError("Invalid or duplicate world IDs")
 
         self._prepare_recoveries(ids, source)
+        if self._batch_reset:
+            from .reset_v7 import reset_batch
+            return reset_batch(self, ids, source)
 
         new = []
         variants = []

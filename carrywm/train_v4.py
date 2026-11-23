@@ -144,6 +144,24 @@ def check_resume(ck, args, version):
             raise ValueError(f'--resume requires the saved {key} value')
 
 
+def _reserve_collection_headroom(device, minimum):
+    """Warp graph allocations cannot reclaim memory held by PyTorch's cache."""
+    free, _ = torch.cuda.mem_get_info(device)
+    reserved = torch.cuda.memory_reserved(device)
+    allocated = torch.cuda.memory_allocated(device)
+    released = 0
+    free_after = free
+    if free < minimum and reserved - allocated >= 64 * 1024**2:
+        torch.cuda.empty_cache()
+        released = max(0, reserved - torch.cuda.memory_reserved(device))
+        free_after, _ = torch.cuda.mem_get_info(device)
+    return {"gpu/free_before_cache_trim_bytes": free,
+            "gpu/free_before_collect_bytes": free_after,
+            "gpu/cache_released_before_collect_bytes": released,
+            "gpu/torch_allocated_before_collect_bytes": allocated,
+            "gpu/torch_reserved_before_collect_bytes": reserved - released}
+
+
 def _run(args, version, learner_type):
     from .collector_v4 import VectorCollector
     from .replay_v4 import VectorReplay
@@ -171,6 +189,7 @@ def _run(args, version, learner_type):
     peak_alloc = peak_reserved = 0
     episodes = {}
     stage_state = None
+    hybrid_clips = getattr(args, 'clip_storage', 'device') == 'hybrid'
     if args.resume:
         ck = torch.load(args.resume, map_location='cpu', weights_only=False)
         check_resume(ck, args, version)
@@ -178,7 +197,7 @@ def _run(args, version, learner_type):
             model.load_state_dict(state)
         for optimizer, state in zip(net.optimizers, ck['optimizers']):
             optimizer.load_state_dict(state)
-        replay = VectorReplay.from_legacy(ck['replay'], device)
+        replay = VectorReplay.from_legacy(ck['replay'], device, hybrid_clips=hybrid_clips)
         first, elapsed = ck['iteration'] + 1, ck['elapsed']
         old_steps, old_ticks = ck['real_steps'], ck['control_ticks']
         peak_alloc, peak_reserved = ck['peak_bytes']
@@ -191,7 +210,7 @@ def _run(args, version, learner_type):
             stage_state = ck['stage_sampler']
         del ck
     else:
-        replay = VectorReplay(args.capacity, args.seed, args.num_envs, device=device)
+        replay = VectorReplay(args.capacity, args.seed, args.num_envs, device=device, hybrid_clips=hybrid_clips)
 
     # Recreate physical environments on restart. A fresh segment in every world
     # prevents a sampled WM sequence from straddling the restart boundary.
@@ -204,7 +223,7 @@ def _run(args, version, learner_type):
         seed=args.seed + old_ticks, device=device, cfgen_ratio=args.cfgen_ratio,
         cfgen_cache_dir=args.cfgen_cache_dir, use_cuda_graph=args.cuda_graph,
         teacher_history=(teacher_init > 0.0 and first <= teacher_decay),
-        **({"v7": True} if version == 7 else {}),
+        **({"v7": True, "gpu_recovery": args.gpu_recovery} if version == 7 else {}),
     )
     if stage_state is not None:
         env.stage_sampler.load_state_dict(stage_state)
@@ -264,6 +283,9 @@ def _run(args, version, learner_type):
                 'warmup/actor_updates': 0, 'warmup/critic_updates': 0, 'warmup/wm_updates': 0,
                 'seconds': time.monotonic() - start})
 
+    phase = 'warmup'
+    iteration = first
+    memory = {}
     try:
         if args.resume:
             resume_teacher = teacher_schedule(first, teacher_init, teacher_decay)
@@ -276,6 +298,7 @@ def _run(args, version, learner_type):
 
         torch.cuda.reset_peak_memory_stats(device)
         for iteration in range(first, args.iterations + 1):
+            phase = 'collection'
             ep_teacher = teacher_schedule(iteration, teacher_init, teacher_decay)
             bc_w = teacher_schedule(iteration, teacher_bc_weight, teacher_decay)
             if env.teacher_history and ep_teacher <= 0.0:
@@ -286,6 +309,8 @@ def _run(args, version, learner_type):
             if should_log:
                 base.sync(device)
             tick = time.monotonic()
+            memory = (_reserve_collection_headroom(device, args.warp_headroom_mib * 1024**2)
+                      if version == 7 else {})
             before = collector.steps
             expected_ticks = clock.ticks_until_update()
             totals = {}
@@ -316,10 +341,12 @@ def _run(args, version, learner_type):
             if should_log:
                 base.sync(device)
             after_collect = time.monotonic()
+            phase = 'wm'
             stats.update(train_v3.wm_iteration(net, replay, args.wm_batch_size))
             if should_log:
                 base.sync(device)
             after_wm = time.monotonic()
+            phase = 'actor_critic'
             if bc_w > 0.0:
                 stats.update(net.policy_update(replay, args.batch_size, bc_weight=bc_w, bc_batch=teacher_bc_batch))
             else:
@@ -340,9 +367,13 @@ def _run(args, version, learner_type):
             )
             if version == 7:
                 stats.update({"sim/vector_ticks": expected_ticks, "replay/ratio_target": REPLAY_RATIO})
+                stats.update(memory)
+                stats.update(replay.clip_bank.storage_metrics())
             if evaluate:
+                phase = 'evaluation'
                 stats.update(base.validate(net, args))
             if should_save:
+                phase = 'checkpoint'
                 save(iteration)
             if should_log:
                 stats['wall_seconds'] = elapsed + time.monotonic() - start
@@ -353,6 +384,18 @@ def _run(args, version, learner_type):
                        wall_seconds=elapsed + time.monotonic() - start, peak_allocated_bytes=peak_alloc,
                        peak_reserved_bytes=peak_reserved, hardware=config['hardware'])
         (output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+    except RuntimeError as exc:
+        if version == 7 and ('out of memory' in str(exc).lower() or isinstance(exc, torch.cuda.OutOfMemoryError)):
+            diagnostic = {'stage': 'cuda_oom', 'phase': phase, 'iteration': iteration,
+                          **memory, **replay.clip_bank.storage_metrics(), 'error': str(exc)}
+            try:
+                diagnostic['gpu/free_on_error_bytes'] = torch.cuda.mem_get_info(device)[0]
+                diagnostic['gpu/torch_allocated_on_error_bytes'] = torch.cuda.memory_allocated(device)
+                diagnostic['gpu/torch_reserved_on_error_bytes'] = torch.cuda.memory_reserved(device)
+            except RuntimeError as query_error:
+                diagnostic['gpu/query_error'] = str(query_error)
+            record(diagnostic)
+        raise
     finally:
         checkpointer.close()
         env.close()

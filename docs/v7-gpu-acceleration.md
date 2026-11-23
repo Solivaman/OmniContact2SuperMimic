@@ -1,0 +1,46 @@
+# V7 GPU acceleration
+
+本版面向 24 GiB RTX 3090 上的无教师搬箱训练。它使用 V7 的 2048 个 MuJoCo Warp 环境，每个控制步积累 0.4 次更新。每轮 WM 做 10 次更新，每次采 1024 个连续 8 步窗口。Actor 使用 2048 条 32 步轨迹，critic 对 4 个小批训练 5 遍。
+
+## 采集为什么中断
+
+原任务最后写入第 245 轮的指标，随后在采集阶段的 `wp.capture_launch` 报 CUDA out of memory。独立显存监控记录整卡峰值为 24081 MiB，训练进程峰值为 23472 MiB。第 200 轮检查点有 735611 帧静态参考和 2812463 帧在线恢复参考。旧实现将两者放在同一块 GPU 张量里。每次容量翻倍需要先分配新张量，再拷贝和释放旧张量。旧日志没有记录最后一次扩容，能够确定的直接故障是 Warp 启动物理图时显存不足。
+
+现在静态参考常驻 GPU，动态恢复参考保存在主机。回放里的片段 ID 和帧号继续有效，采集和训练只传本批需要的动态帧。第 200 轮检查点的静态缓存为 311.48 MiB。用 2048 条真实检查点样本混合抽取静态及动态片段，1、11 和 83 帧窗口均与旧库逐元素相同。控制动态比例为 10% 时，83 帧窗口中位耗时由 0.62 ms 增至 3.24 ms。此处的 10% 是基准负载，训练中在线恢复片段的实际占比由掉箱过程决定。
+
+每轮采集前检查驱动的可用显存，低于 1536 MiB 时尝试归还 PyTorch 的闲置缓存。监控另报 PyTorch 占用、驱动剩余空间及参考库容量。训练检查点仍能保存和加载完整回放，包括在线恢复生成的参考。恢复训练会按原训练器的逻辑初始化新的物理回合。
+
+## 物理重置和掉箱恢复
+
+普通重置沿用各环境自己的随机数流选择来源、场景和阶段。CPU 对选中行批量装配机器人与箱子的位姿和速度，然后一次传到 GPU，MuJoCo Warp 掩码重置对应的世界。只有遇到新箱体尺寸时才增加几何表项。全 GPU 保存另一份重置状态表，在常见的稀疏重置上没有测到稳定优势。
+
+在线恢复以掉落瞬间的机器人、箱体状态和原目标为输入。原有带边界的 IK 求解器使用两腕、两掌、躯干、两踝的位姿，其中包括朝向。求解器产生关节和骨盆轨迹，GPU 批量 FK 再生成整段参考需要的连杆位姿。通过抓握有效性判定后才切换参考，物理状态和速度继续沿用掉落现场。批处理只操作同一控制步实际触发恢复的环境。
+
+## 旋转融合
+
+InstantTrack 的编译路径把固定大小的矩阵乘和矩阵向量乘写成逐元素乘加，由 Inductor 合并。V7 的 FK 树以前直接乘 4×4 齐次变换。融合实现将每步拆为旋转乘积和位移的旋转加平移，并在最终输出处恢复原来的 4×4 表示。编码器、奖励和历史观测继续使用原来的接口。针对 V7 的 TF32 设置，融合范围限定在 FK 树内部。整个采集和学习都使用同一套原有 V7 网络权重结构。[InstantTrack 的旋转实现](https://github.com/Huy-Quang-Dao/instantTrack/blob/b9512a96d4e82e6ddea9a6de3b03276888bbcb2c/src/instanttrack/rotations.py)
+
+## 复验
+
+在已安装训练依赖的环境中，从项目根目录运行。将 `CARRY_SIM_ROOT`、`CARRY_MOTION_DIR` 和 `CACHE_DIR` 指向官方仿真项目、搬箱 NPZ 目录和预生成参考缓存。
+
+```bash
+python -m pytest -q tests/test_v7_memory.py tests/test_v7_reset_batch.py
+python -m scripts.check_v7_gpu_reset --sim-root "$CARRY_SIM_ROOT" --motion-dir "$CARRY_MOTION_DIR" --cache-dir "$CACHE_DIR" --device cuda:0
+python -m scripts.bench_v7_rotations --sim-root "$CARRY_SIM_ROOT" --output rotations.json
+```
+
+## 实测范围
+
+RTX 3090 上用 8 个 CPU 工人处理 48 次真实掉箱，每组 8 个，两种方法交替执行。原 CPU 优化版用时 9.375 秒，本版用时 5.751 秒，含工人排队、进程间传输和 GPU 回传。全部 28715 帧 × 111 维的最大绝对偏差为 2.98e-7。阶段、接受判定和四元数符号全部一致。另测 8 个构造的边界场景，两路均接受其中 2 个、拒绝 6 个。
+
+原 IK 每次查询的七个链接位姿，用单个 CPU 工人约 0.039 ms，用本版 GPU 实现连同往返约 2.56 ms。29 个候选分别为 0.37 ms 和 2.51 ms。在 232 个候选的理想同步批次才分别为 2.86 ms 和 2.57 ms。正式版保留 SciPy 有界求解器及其停止规则，在 CPU 求解期间读取七个链接的位置和朝向，在 GPU 上统一补全多条参考。
+
+2048 条样本的编译几何测试，FK、观测、目标和掌心特征的前向及输入反向合计由 14.32 ms 降到 12.86 ms。最终融合仅用于 FK 树，编码和奖励继续使用原有旋转计算。与独立 FP64 基准相比，融合后输入梯度的相对 L2 误差为 2.2e-7，原 TF32 路径为 9.2e-5。这几组时间描述各自的测量范围，端到端采集和更新耗时可在训练的 metrics.jsonl 中查看。
+
+V7 训练器默认启用混合参考库、批量重置、批量参考 FK 与编译 FK 融合。可用 `--no-gpu-recovery` 和 `--no-fused-rotations` 分别回到原有两条计算路径，以便在其他硬件上复核。
+
+```bash
+python -m scripts.bench_v7_recovery --sim-root "$CARRY_SIM_ROOT" --inputs captured-drops.json --output recovery.json --workers 8 --group-size 8
+python -m scripts.bench_v7_ik_queries --sim-root "$CARRY_SIM_ROOT" --motion-dir "$CARRY_MOTION_DIR" --output ik-queries.json
+```

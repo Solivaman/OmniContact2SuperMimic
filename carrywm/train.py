@@ -144,6 +144,7 @@ class Learner:
             action_rate_weight=getattr(args, "action_rate_weight", -0.1),
             action_l2_weight=getattr(args, "action_l2_weight", 0.0),
             box_goal=self.box_features,
+            fused_rotations=self.box_features and getattr(args, "fused_rotations", False),
         ).to(self.device)
         goal_dim = BOX_GOAL_DIM if self.box_features else GOAL_DIM
         self.actor = Actor(first_width=args.encoder_width, decoder_width=args.decoder_width,
