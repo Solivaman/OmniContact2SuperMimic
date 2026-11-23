@@ -1,10 +1,15 @@
 """Regression tests for V5 GPU acceleration (replay, finish_step_gpu, learner steps, async save)."""
 from collections import deque
+from contextlib import ExitStack
+import os
 from pathlib import Path
 import pickle
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -318,6 +323,81 @@ class LearnerAndCheckpointerTests(unittest.TestCase):
         self.assertFalse(toggled.compile)
         self.assertFalse(toggled.cuda_graph)
         self.assertFalse(toggled.async_save)
+
+
+class WarpStreamInitTests(unittest.TestCase):
+    def test_wp_init_called_before_stream_from_torch(self):
+        import carrywm.warp_sim as ws
+
+        class _CheckedStreamInit(RuntimeError):
+            pass
+
+        events = []
+        dummy_proto = SimpleNamespace(
+            root=Path("."),
+            paths=[],
+            bp=7,
+            bv=6,
+            table_ids=[0, 1],
+            tables_geom=[1, 2],
+            _set_scene=lambda *a, **kw: None,
+        )
+        dummy_model = SimpleNamespace(
+            geom=lambda _name: SimpleNamespace(id=0),
+            body=lambda _name: SimpleNamespace(id=0),
+            qpos0=np.zeros(43, dtype=float),
+            nv=41,
+            nmocap=2,
+            nbody=2,
+            geom_size=np.ones((4, 3), dtype=float),
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(ws, "_Episode", return_value=dummy_proto))
+            stack.enter_context(mock.patch.object(ws, "_scene", return_value=dummy_model))
+            stack.enter_context(mock.patch.object(ws.mj, "MjData", return_value=SimpleNamespace()))
+            stack.enter_context(mock.patch.object(
+                ws.torch.cuda, "Stream", side_effect=lambda device=None: events.append("cuda.Stream") or "cuda_stream"
+            ))
+            stack.enter_context(mock.patch.object(
+                ws.wp, "init", side_effect=lambda: events.append("wp.init")
+            ))
+            stack.enter_context(mock.patch.object(
+                ws.wp, "stream_from_torch",
+                side_effect=lambda s: events.append(("wp.stream_from_torch", s)) or "wp_stream",
+            ))
+            stack.enter_context(mock.patch.object(
+                ws.wp, "ScopedDevice", side_effect=_CheckedStreamInit("stop after stream init")
+            ))
+            with self.assertRaises(_CheckedStreamInit):
+                ws.WarpCarryWorlds("unused_sim", "unused_motion", num_envs=1, split="eval",
+                                   cfgen_ratio=0., device="cuda:0")
+
+        self.assertEqual(
+            events,
+            ["wp.init", "cuda.Stream", ("wp.stream_from_torch", "cuda_stream")],
+        )
+
+    @unittest.skipUnless(
+        os.getenv("CARRY_SIM_ROOT")
+        and os.getenv("CARRY_WARP_DEVICE", "").startswith("cuda")
+        and torch.cuda.is_available(),
+        "set CARRY_SIM_ROOT and CARRY_WARP_DEVICE=cuda:N on a CUDA machine to verify fresh runtime init",
+    )
+    def test_fresh_process_warp_cuda_init(self):
+        root = os.environ["CARRY_SIM_ROOT"]
+        motion = os.environ.get("CARRY_MOTION_DIR", str(Path(root) / "data/carrybox"))
+        device = os.environ["CARRY_WARP_DEVICE"]
+        code = (
+            "import warp as wp; "
+            "assert wp._src.context.runtime is None, 'expected uninitialized warp runtime'; "
+            "from carrywm.warp_sim import WarpCarryWorlds; "
+            f"w = WarpCarryWorlds({root!r}, {motion!r}, num_envs=2, seed=17, device={device!r}, cfgen_ratio=0.); "
+            "assert w._wp_stream is not None; "
+            "w.close()"
+        )
+        proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, msg=f"stdout={proc.stdout}\nstderr={proc.stderr}")
 
 
 if __name__ == "__main__":

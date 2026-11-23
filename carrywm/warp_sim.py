@@ -370,6 +370,7 @@ class WarpCarryWorlds:
         if split == "train" and cfgen_ratio > 0 and cfgen_goal_noise_std_m == 0:
             _warm_cfgen_cache(prototype, self._table2_geom, model, cfgen_cache_dir, plan_workers)
 
+        wp.init()
         if self.device.type == "cuda":
             self._cuda_stream = torch.cuda.Stream(device=self.device)
             self._wp_stream = wp.stream_from_torch(self._cuda_stream)
