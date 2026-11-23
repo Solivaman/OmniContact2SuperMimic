@@ -189,7 +189,10 @@ def _run(args, version, learner_type):
     peak_alloc = peak_reserved = 0
     episodes = {}
     stage_state = None
-    hybrid_clips = getattr(args, 'clip_storage', 'device') == 'hybrid'
+    clip_options = (dict(clip_storage=args.clip_storage,
+                         clip_max_device_bytes=int(args.clip_budget_gib * 1024**3),
+                         clip_reserve_device_bytes=args.warp_headroom_mib * 1024**2)
+                    if version == 7 else {})
     if args.resume:
         ck = torch.load(args.resume, map_location='cpu', weights_only=False)
         check_resume(ck, args, version)
@@ -197,7 +200,7 @@ def _run(args, version, learner_type):
             model.load_state_dict(state)
         for optimizer, state in zip(net.optimizers, ck['optimizers']):
             optimizer.load_state_dict(state)
-        replay = VectorReplay.from_legacy(ck['replay'], device, hybrid_clips=hybrid_clips)
+        replay = VectorReplay.from_legacy(ck['replay'], device, **clip_options)
         first, elapsed = ck['iteration'] + 1, ck['elapsed']
         old_steps, old_ticks = ck['real_steps'], ck['control_ticks']
         peak_alloc, peak_reserved = ck['peak_bytes']
@@ -210,7 +213,7 @@ def _run(args, version, learner_type):
             stage_state = ck['stage_sampler']
         del ck
     else:
-        replay = VectorReplay(args.capacity, args.seed, args.num_envs, device=device, hybrid_clips=hybrid_clips)
+        replay = VectorReplay(args.capacity, args.seed, args.num_envs, device=device, **clip_options)
 
     # Recreate physical environments on restart. A fresh segment in every world
     # prevents a sampled WM sequence from straddling the restart boundary.

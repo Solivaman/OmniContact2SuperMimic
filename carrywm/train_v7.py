@@ -1,5 +1,6 @@
 """Learn carry-box control from simulated transitions and motion references."""
 import argparse
+import math
 
 from . import train_v4, train_v6
 from .v7 import LearnerV7
@@ -8,8 +9,10 @@ from .v7 import LearnerV7
 def configure(parser):
     train_v6.configure(parser)
     parser.description = __doc__
-    parser.add_argument("--clip-storage", choices=("hybrid", "device"), default="hybrid",
-                        help="Cache static clips on GPU and keep recovery frames in host RAM, or keep both on GPU")
+    parser.add_argument("--clip-storage", choices=("hybrid", "device"), default="device",
+                        help="Store all references in growable GPU pages (device), or store recovery frames in host RAM (hybrid)")
+    parser.add_argument("--clip-budget-gib", type=float, default=11.0,
+                        help="GPU reference page and index budget in GiB; allocated as references arrive")
     parser.add_argument("--warp-headroom-mib", type=int, default=1536,
                         help="Release unused PyTorch cache before collection when driver free memory falls below this size")
     parser.add_argument("--gpu-recovery", action=argparse.BooleanOptionalAction, default=True,
@@ -29,6 +32,8 @@ def args_from_cli(argv=None):
         raise ValueError("V7 uses its own actor from initialization and throughout collection and learning")
     if args.goal_mode != "full":
         raise ValueError("V7 requires full references with future box poses")
+    if not math.isfinite(args.clip_budget_gib) or args.clip_budget_gib <= 0:
+        raise ValueError("clip-budget-gib must be positive and finite")
     if args.warp_headroom_mib < 0:
         raise ValueError("warp-headroom-mib must be nonnegative")
     return train_v6.configure_objective(args)

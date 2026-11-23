@@ -315,6 +315,37 @@ class HybridClipBank:
         return result
 
 
+def _reference_bank(bank, device, *, clip_storage=None, hybrid_clips=False,
+                    clip_max_device_bytes=None, clip_reserve_device_bytes=0):
+    # Existing replay callers keep the flat representation; V7 explicitly
+    # selects a GPU-paged reference store. Checkpoints share the flat CPU format.
+    from .device_clips import PagedClipBank
+    mode = clip_storage or ("hybrid" if hybrid_clips else "contiguous")
+    if mode not in ("device", "contiguous", "hybrid"):
+        raise ValueError(f"Unknown reference storage mode: {mode}")
+    if mode == "device":
+        if bank is None:
+            return PagedClipBank(device, max_device_bytes=clip_max_device_bytes,
+                                 reserve_device_bytes=clip_reserve_device_bytes)
+        if (isinstance(bank, PagedClipBank) and bank.device == device
+                and bank.max_device_bytes == clip_max_device_bytes
+                and bank.reserve_device_bytes == clip_reserve_device_bytes):
+            return bank
+    if mode == "hybrid" and isinstance(bank, HybridClipBank) and bank.device == device:
+        return bank
+    if isinstance(bank, PagedClipBank):
+        bank = bank.snapshot_cpu()
+    elif isinstance(bank, HybridClipBank):
+        bank = bank.host
+    if mode == "contiguous":
+        return ClipBank(device=device) if bank is None else bank.to(device)
+    host = bank.to("cpu") if bank is not None else ClipBank()
+    if mode == "hybrid":
+        return HybridClipBank(host, device)
+    return PagedClipBank.from_host(host, device, max_device_bytes=clip_max_device_bytes,
+                                   reserve_device_bytes=clip_reserve_device_bytes)
+
+
 class VectorReplay:
     """Time-major ring on GPU or CPU. A terminal transition retains its actual final state.
 
@@ -322,7 +353,8 @@ class VectorReplay:
     Raw reference clips live in ClipBank and are shared across all rows of each episode.
     """
 
-    def __init__(self, capacity, seed, num_envs, device="cpu", *, hybrid_clips=False):
+    def __init__(self, capacity, seed, num_envs, device="cpu", *, hybrid_clips=False, clip_storage=None,
+                 clip_max_device_bytes=None, clip_reserve_device_bytes=0):
         if num_envs < 1 or capacity < num_envs:
             raise ValueError("Replay capacity must fit at least one complete vector tick")
         self.device = torch.device(device)
@@ -338,8 +370,9 @@ class VectorReplay:
         self._first = torch.zeros(num_envs, dtype=torch.int64, device=self.device)
         self._restart = True
         self._windows = {}
-        self.clip_bank = (HybridClipBank(ClipBank(), self.device) if hybrid_clips
-                          else ClipBank(device=self.device))
+        self.clip_bank = _reference_bank(None, self.device, clip_storage=clip_storage, hybrid_clips=hybrid_clips,
+                                         clip_max_device_bytes=clip_max_device_bytes,
+                                         clip_reserve_device_bytes=clip_reserve_device_bytes)
 
         shape = (self.rows, num_envs)
 
@@ -535,16 +568,14 @@ class VectorReplay:
         raw_win = self.clip_bank.gather(self.clip_ids[row, world], self.frames[row, world], offsets_t)
         return self.states[row, world], history, raw_win, self.actions[row, world]
 
-    def to(self, device, *, hybrid_clips=False):
+    def to(self, device, *, hybrid_clips=False, clip_storage=None,
+                 clip_max_device_bytes=None, clip_reserve_device_bytes=0):
         target = torch.device(device)
         if target.type == "cuda" and target.index is None:
             target = torch.device("cuda", torch.cuda.current_device())
-        host = self.clip_bank.host if isinstance(self.clip_bank, HybridClipBank) else self.clip_bank
-        if hybrid_clips:
-            if not isinstance(self.clip_bank, HybridClipBank) or self.clip_bank.device != target:
-                self.clip_bank = HybridClipBank(host.to("cpu"), target)
-        else:
-            self.clip_bank = host.to(target)
+        self.clip_bank = _reference_bank(self.clip_bank, target, clip_storage=clip_storage, hybrid_clips=hybrid_clips,
+                                         clip_max_device_bytes=clip_max_device_bytes,
+                                         clip_reserve_device_bytes=clip_reserve_device_bytes)
         if target == self.device:
             return self
         self.device = target
@@ -661,10 +692,12 @@ class VectorReplay:
         self._actor_offsets = torch.arange(83, dtype=torch.int64)
 
     @classmethod
-    def from_legacy(cls, old, device="cpu", *, hybrid_clips=False):
+    def from_legacy(cls, old, device="cpu", *, hybrid_clips=False, clip_storage=None,
+                 clip_max_device_bytes=None, clip_reserve_device_bytes=0):
         """Convert an older NumPy-backed VectorReplay checkpoint to the GPU/CPU tensor layout."""
         if isinstance(old, cls):
-            return old.to(device, hybrid_clips=hybrid_clips)
+            return old.to(device, hybrid_clips=hybrid_clips, clip_storage=clip_storage,
+                          clip_max_device_bytes=clip_max_device_bytes, clip_reserve_device_bytes=clip_reserve_device_bytes)
         seed = int(old.rng.integers(0, 2**31 - 1))
         rep = cls(old.capacity, seed, old.num_envs, device="cpu")
         rep.rng.bit_generator.state = old.rng.bit_generator.state
@@ -683,4 +716,5 @@ class VectorReplay:
                 clip = row_clips[c]
                 if clip is not None:
                     rep.clip_ids[r, c] = rep.clip_bank.register(clip, static=False)
-        return rep.to(device, hybrid_clips=hybrid_clips)
+        return rep.to(device, hybrid_clips=hybrid_clips, clip_storage=clip_storage,
+                      clip_max_device_bytes=clip_max_device_bytes, clip_reserve_device_bytes=clip_reserve_device_bytes)
