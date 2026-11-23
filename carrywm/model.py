@@ -183,8 +183,9 @@ class WorldModel(nn.Module):
         return torch.cat(features, -1)
 
     @torch.no_grad()
-    def update_stats(self, state, action, ctx):
-        self.inputs.update(self._features(state, action, ctx))
+    def update_stats(self, state, action, ctx, *, features_fn=None):
+        fn = self._features if features_fn is None else features_fn
+        self.inputs.update(fn(state, action, ctx))
 
     def forward(self, state, action, ctx, fk=None):
         initial = self._features(state, action, ctx, fk)
@@ -282,6 +283,7 @@ class CarryGeometry(nn.Module):
                                     ("rest_quat",quats,torch.float32), ("hinge",angles,torch.long)):
             self.register_buffer(name, torch.tensor(values, dtype=dtype))
         self.jumps = 0
+        raw_parents = list(parents)
         parents = torch.tensor(parents)
         while parents.any():
             self.register_buffer(f"ancestors_{self.jumps}", parents)
@@ -301,6 +303,29 @@ class CarryGeometry(nn.Module):
             from .geometry_v7 import palm_surface_offsets
             self.register_buffer("pad_offsets", torch.tensor(palm_surface_offsets(root), dtype=torch.float32),
                                  persistent=False)
+            keep = {0, 1}
+            for pid in self.flow_ids[:2].tolist():
+                cur = pid
+                while cur > 0 and cur not in keep:
+                    keep.add(cur)
+                    cur = raw_parents[cur]
+            keep = sorted(keep)
+            remap = {orig: i for i, orig in enumerate(keep)}
+            keep_t = torch.tensor(keep, dtype=torch.long)
+            for name, src in (("palm_axis", self.axis), ("palm_offset", self.offset),
+                              ("palm_rest_quat", self.rest_quat), ("palm_hinge", self.hinge)):
+                self.register_buffer(name, src.index_select(0, keep_t).clone(), persistent=False)
+            self.register_buffer(
+                "palm_out_ids",
+                torch.tensor([remap[pid] for pid in self.flow_ids[:2].tolist()], dtype=torch.long),
+                persistent=False,
+            )
+            palm_parents = torch.tensor([remap[raw_parents[orig]] for orig in keep], dtype=torch.long)
+            self.palm_jumps = 0
+            while palm_parents.any():
+                self.register_buffer(f"palm_ancestors_{self.palm_jumps}", palm_parents, persistent=False)
+                self.palm_jumps += 1
+                palm_parents = palm_parents[palm_parents]
 
     def _mm3(self, left, right):
         if self.fused_rotations and torch.compiler.is_compiling():
@@ -311,6 +336,25 @@ class CarryGeometry(nn.Module):
         if self.fused_rotations and torch.compiler.is_compiling():
             return (rotation * vector.unsqueeze(-2)).sum(-1)
         return _apply(rotation, vector)
+
+    def palm_fk(self, root_pos, root_quat, joints):
+        """Compact upper-body forward kinematics returning (rot [..., 2, 3, 3], pos [..., 2, 3]) for both palms."""
+        padded = F.pad(joints, (0, 1))
+        half = 0.5 * padded.index_select(-1, self.palm_hinge)
+        moving = torch.cat((half.cos().unsqueeze(-1), half.sin().unsqueeze(-1) * self.palm_axis), -1)
+        local = quat_mul(self.palm_rest_quat.expand_as(moving), moving)
+        pos = self.palm_offset.expand_as(local[..., :3])
+        root_rot = quat_matrix(root_quat).unsqueeze(-3)
+        identity = torch.eye(3, dtype=root_rot.dtype, device=root_rot.device).expand_as(root_rot)
+        rotation = torch.cat((identity, root_rot, quat_matrix(local[..., 2:, :])), -3)
+        translation = torch.cat((torch.zeros_like(root_pos.unsqueeze(-2)), root_pos.unsqueeze(-2),
+                                 pos[..., 2:, :]), -2)
+        for level in range(self.palm_jumps):
+            ancestors = getattr(self, f"palm_ancestors_{level}")
+            parent = rotation.index_select(-3, ancestors)
+            translation = translation.index_select(-2, ancestors) + self._mv3(parent, translation)
+            rotation = self._mm3(parent, rotation)
+        return rotation.index_select(-3, self.palm_out_ids), translation.index_select(-2, self.palm_out_ids)
 
     def fk(self, root_pos, root_quat, joints):
         padded = F.pad(joints, (0,1))
@@ -345,9 +389,13 @@ class CarryGeometry(nn.Module):
 
     def palms_in_box(self, state, ctx, fk=None):
         """Left/right palm-pad centres in the box frame, in units of box half-size."""
-        fk = self.forward_kinematics(state) if fk is None else fk
-        palms = fk.index_select(-3, self.flow_ids[:2])
-        pads = palms[..., :3, 3] + _apply(palms[..., :3, :3], self.pad_offsets)
+        if fk is None and hasattr(self, "palm_out_ids"):
+            palm_rot, palm_pos = self.palm_fk(state[..., :3], state[..., 3:7], state[..., 7:36])
+            pads = palm_pos + _apply(palm_rot, self.pad_offsets)
+        else:
+            fk = self.forward_kinematics(state) if fk is None else fk
+            palms = fk.index_select(-3, self.flow_ids[:2])
+            pads = palms[..., :3, 3] + _apply(palms[..., :3, :3], self.pad_offsets)
         box_inv = quat_matrix(state[..., 74:78]).transpose(-1, -2).unsqueeze(-3)
         local = _apply(box_inv, pads - state[..., None, 71:74])
         return (local / ctx[..., None, :3].clamp_min(1e-6)).flatten(-2)

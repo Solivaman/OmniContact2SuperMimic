@@ -24,6 +24,7 @@ from .sim import CarryEnv, DEFAULT_CFGEN_GOAL_NOISE_STD_M
 OFFSETS = (0, 1, 2, 3, 4, 8, 12, 16, 24, 32, 50)
 WM_STEPS = 8
 HORIZON = 32
+ROLLOUT_CHUNK = 4
 GAMMA = 0.99
 LAMBDA = 0.95
 # Per-channel proprioception/box observation noise scales matching CarryGeometry.observation (141-dim).
@@ -163,14 +164,19 @@ class Learner:
         )
         self._step_offsets = torch.arange(1, HORIZON + 1, device=self.device)[:, None] + self.offsets[None, :]
         self._step_numbers = torch.arange(1, HORIZON + 1, dtype=torch.float32, device=self.device)
+        self._gamma_pows = torch.tensor([GAMMA**j for j in range(HORIZON)], dtype=torch.float32, device=self.device)
+        self._compiled_wm_features = self.wm._features
         self._compiled_wm_loss = self._wm_rollout_loss
         self._compiled_imagine_step = self._imagine_step
+        self._compiled_imagine_chunk = self._imagine_chunk
         self._compiled_critic = self.critic
         self._compiled_collect_act = self._collect_act_impl
         if getattr(args, "compile", False) and self.device.type == "cuda":
             try:
+                self._compiled_wm_features = torch.compile(self.wm._features)
                 self._compiled_wm_loss = torch.compile(self._wm_rollout_loss)
                 self._compiled_imagine_step = torch.compile(self._imagine_step)
+                self._compiled_imagine_chunk = torch.compile(self._imagine_chunk)
                 self._compiled_critic = torch.compile(self.critic, dynamic=True)
                 self._compiled_collect_act = torch.compile(self._collect_act_impl)
             except Exception as exc:
@@ -214,15 +220,23 @@ class Learner:
         loss = loss / WM_STEPS
         return loss, state
 
-    def wm_update(self, replay, batch_size):
+    def wm_update(self, replay, batch_size, *, update_stats=True, defer_metrics=False):
         s, a, c, ctx = (tensor(v, self.device) for v in replay.wm(batch_size, WM_STEPS))
-        self.wm.update_stats(s[:, :-1].reshape(-1, 84), a.reshape(-1, 29),
-                             ctx[:, None].expand(-1, WM_STEPS, -1).reshape(-1, ctx.shape[-1]))
+        if update_stats:
+            self.wm.update_stats(
+                s[:, :-1].reshape(-1, 84),
+                a.reshape(-1, 29),
+                ctx[:, None].expand(-1, WM_STEPS, -1).reshape(-1, ctx.shape[-1]),
+                features_fn=getattr(self, "_compiled_wm_features", None),
+            )
         fn = getattr(self, "_compiled_wm_loss", self._wm_rollout_loss)
         loss, state = fn(s, a, c, ctx)
         update(self.optimizers[0], self.wm, loss)
-        return {"wm/loss": float(loss.detach()),
-                "wm/box_8step_m": (state[:, 71:74]-s[:, -1, 71:74]).norm(dim=-1).mean().item()}
+        loss_d = loss.detach()
+        box_err = (state[:, 71:74] - s[:, -1, 71:74]).norm(dim=-1).mean().detach()
+        if defer_metrics:
+            return {"wm/loss": loss_d, "wm/box_8step_m": box_err}
+        return {"wm/loss": float(loss_d), "wm/box_8step_m": float(box_err)}
 
     def _value(self, states, goals, contexts):
         critic_fn = getattr(self, "_compiled_critic", self.critic)
@@ -267,6 +281,30 @@ class Learner:
         next_goal = self.reference(after, raw_next_win, fk=next_fk)
         return after, action, next_fk, next_goal, next_hist, reward, cont, within_boundary, slip_frames
 
+    def _imagine_chunk(self, state, prev, ctx, hist, goal, fk, raw, target_next,
+                       raw_offsets_chunk, target_fk_chunk, step_nums_chunk, gammas_chunk,
+                       slip_frames, mask, in_episode, ret, remaining, checkpoint_encoder=False):
+        states, goals, rewards, continuations, valid_rows = [], [], [], [], []
+        for k in range(ROLLOUT_CHUNK):
+            states.append(state.detach())
+            goals.append(goal.detach())
+            valid_rows.append(in_episode)
+            raw_next_win = raw.index_select(1, raw_offsets_chunk[k])
+            (after, action, next_fk, next_goal, next_hist,
+             reward, cont, within_boundary, slip_frames) = self._imagine_step(
+                state, prev, ctx, hist, goal, fk, target_next[:, k], raw_next_win,
+                target_fk_chunk[:, k], slip_frames, step_nums_chunk[k], remaining, checkpoint_encoder
+            )
+            rewards.append(reward.detach())
+            continuations.append(cont.detach())
+            ret = ret + gammas_chunk[k] * mask * reward
+            mask = mask * cont
+            in_episode = in_episode & within_boundary
+            state, prev, fk, goal, hist = after, action, next_fk, next_goal, next_hist
+        return (state, prev, fk, goal, hist, slip_frames, mask, in_episode, ret,
+                torch.stack(states), torch.stack(goals), torch.stack(rewards),
+                torch.stack(continuations), torch.stack(valid_rows))
+
     def _rollout(self, inputs, *, update_stats=False, checkpoint_encoder=False):
         """Closed-loop imagination; caller owns freezing and optimizer steps."""
         state, prev, ctx, hist, raw, remaining = inputs
@@ -291,24 +329,43 @@ class Learner:
         step_numbers = getattr(self, "_step_numbers", None)
         if step_numbers is None:
             step_numbers = torch.arange(1, HORIZON + 1, dtype=torch.float32, device=state.device)
-        step_fn = getattr(self, "_compiled_imagine_step", self._imagine_step)
-        for j in range(HORIZON):
-            states.append(state.detach())
-            goals.append(goal.detach())
-            valid_rows.append(in_episode)
-            target = raw[:, j+1]
-            raw_next_win = raw.index_select(1, step_offsets[j])
-            (after, action, next_fk, next_goal, next_hist,
-             reward, cont, within_boundary, slip_frames) = step_fn(
-                state, prev, ctx, hist, goal, fk, target, raw_next_win,
-                target_fk[:, j], slip_frames, step_numbers[j], remaining, checkpoint_encoder
-            )
-            rewards.append(reward.detach())
-            continuations.append(cont.detach())
-            ret = ret + (GAMMA**j) * mask * reward
-            mask = mask * cont
-            in_episode = in_episode & within_boundary
-            state, prev, fk, goal, hist = after, action, next_fk, next_goal, next_hist
+        gamma_pows = getattr(self, "_gamma_pows", None)
+        if gamma_pows is None:
+            gamma_pows = torch.tensor([GAMMA**j for j in range(HORIZON)], dtype=torch.float32, device=state.device)
+        if HORIZON % ROLLOUT_CHUNK == 0:
+            chunk_fn = getattr(self, "_compiled_imagine_chunk", self._imagine_chunk)
+            for j in range(0, HORIZON, ROLLOUT_CHUNK):
+                end = j + ROLLOUT_CHUNK
+                (state, prev, fk, goal, hist, slip_frames, mask, in_episode, ret,
+                 c_states, c_goals, c_rewards, c_conts, c_valid) = chunk_fn(
+                    state, prev, ctx, hist, goal, fk, raw, raw[:, j+1:end+1],
+                    step_offsets[j:end], target_fk[:, j:end], step_numbers[j:end], gamma_pows[j:end],
+                    slip_frames, mask, in_episode, ret, remaining, checkpoint_encoder
+                )
+                states.extend(c_states.unbind(0))
+                goals.extend(c_goals.unbind(0))
+                rewards.extend(c_rewards.unbind(0))
+                continuations.extend(c_conts.unbind(0))
+                valid_rows.extend(c_valid.unbind(0))
+        else:
+            step_fn = getattr(self, "_compiled_imagine_step", self._imagine_step)
+            for j in range(HORIZON):
+                states.append(state.detach())
+                goals.append(goal.detach())
+                valid_rows.append(in_episode)
+                target = raw[:, j+1]
+                raw_next_win = raw.index_select(1, step_offsets[j])
+                (after, action, next_fk, next_goal, next_hist,
+                 reward, cont, within_boundary, slip_frames) = step_fn(
+                    state, prev, ctx, hist, goal, fk, target, raw_next_win,
+                    target_fk[:, j], slip_frames, step_numbers[j], remaining, checkpoint_encoder
+                )
+                rewards.append(reward.detach())
+                continuations.append(cont.detach())
+                ret = ret + gamma_pows[j] * mask * reward
+                mask = mask * cont
+                in_episode = in_episode & within_boundary
+                state, prev, fk, goal, hist = after, action, next_fk, next_goal, next_hist
         terminal = self._limit_return(self._value(state, goal, ctx))
         ret = ret + (GAMMA**HORIZON)*mask*terminal
         states.append(state.detach())
@@ -439,7 +496,10 @@ class Collector:
 def _init_eval_worker():
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
     torch.set_num_threads(1)
 
 

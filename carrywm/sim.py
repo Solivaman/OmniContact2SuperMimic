@@ -211,6 +211,7 @@ class CarryEnv:
         return True
 
     def _load_main_episode(self, path, source, stage):
+        self._clip_catalogue = None
         scene = self._load_scene(path)
         self._bind_scene(scene.half)
         self.source, self.name = source, path.stem
@@ -235,6 +236,7 @@ class CarryEnv:
         if self.stage_sampler is not None:
             catalogue = self.stage_sampler.catalogue(self.root, self.clip, self.half, source, self.phase,
                                                     scene.tables, self.m.geom_size[self.tables_geom])
+            self._clip_catalogue = catalogue
             self.index = self.stage_sampler.choose(catalogue, source, self.rng, stage)
             self.start_stage = STAGES[catalogue.labels[self.index]]
             if source == "npz":
@@ -255,6 +257,9 @@ class CarryEnv:
         self._forward_reset()
 
     def _starts_holding(self):
+        cat = getattr(self, "_clip_catalogue", None)
+        if cat is not None and cat.starts_holding is not None:
+            return bool(cat.starts_holding[self.index])
         # A held suffix needs a carry/drop history, but a box resting on either
         # support must earn its first lift in physical simulation.
         f = self.clip[self.index]
@@ -280,11 +285,13 @@ class CarryEnv:
         attempt = self.pending_recovery and source is None
         self.pending_recovery = False
         if attempt and self._try_recovery():
+            self._clip_catalogue = None
             self._teacher_ankles = None
             self.source = "recovery"
             self.name = f"{self.name}/recovery"
             self.index = 0
         else:
+            self._clip_gpu = None
             self.recovery_rejected += int(attempt)
             if source is None:
                 source = "cfgen" if self.rng.random() < self.cfgen_ratio else "npz"

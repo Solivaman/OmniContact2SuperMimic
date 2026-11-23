@@ -1,5 +1,5 @@
 """Batched, 50 Hz MuJoCo Warp carry physics; one MjWarp Data for all worlds."""
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 import copy
@@ -139,7 +139,10 @@ def finish_step_gpu(state, contacts, support, initial_box, goal, goal_on_floor,
 def _init_cpu_worker():
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
     torch.set_num_threads(1)
 
 
@@ -349,7 +352,8 @@ class WarpCarryWorlds:
     def __init__(self, sim_root, motion_dir, num_envs, seed=42, split="train", cfgen_ratio=.1,
                  cfgen_goal_noise_std_m=0., device="cuda:0", nconmax=64, njmax=256,
                  teacher_history=False, cfgen_cache_dir=None, plan_workers=None,
-                 recovery_workers=None, use_cuda_graph=True, v7=False, gpu_recovery=False):
+                 recovery_workers=None, use_cuda_graph=True, v7=False, gpu_recovery=False,
+                 defer_recovery=False):
         if num_envs < 1 or nconmax < 1 or njmax < 1:
             raise ValueError("World count and contact/constraint capacities must be positive")
         self.num_envs = num_envs
@@ -360,6 +364,7 @@ class WarpCarryWorlds:
         self._use_cuda_graph = bool(use_cuda_graph) and self.device.type == "cuda"
         self._batch_reset = v7 and self.device.type == "cuda" and not teacher_history
         self._gpu_recovery = bool(gpu_recovery and v7 and self.device.type == "cuda")
+        self._keep_recovery_on_device = False
         self._recovery_fk = None
         self._reset_geometry_slots = {}
         self._reset_geometry_table = {}
@@ -367,14 +372,22 @@ class WarpCarryWorlds:
         self._graph_warmed = False
         self._graph_failed = False
         self._rec_pool = None
-        self._recovery_workers = (
-            recovery_workers if recovery_workers is not None
-            else min(8, max(1, (os.cpu_count() or 2) // 4))
-        )
+        if recovery_workers is not None:
+            self._recovery_workers = int(recovery_workers)
+        elif v7:
+            self._recovery_workers = min(16, max(1, (os.cpu_count() or 2) // 2))
+        else:
+            self._recovery_workers = min(8, max(1, (os.cpu_count() or 2) // 4))
         self.v7 = v7
         self._recovery_futures = {} if v7 and self.device.type == "cuda" and self._recovery_workers > 0 else None
+        self._defer_recovery = bool(defer_recovery and self._batch_reset and self._recovery_futures is not None)
+        self._deferred_recoveries = deque()
+        self._max_inflight_recoveries = max(32, 4 * self._recovery_workers)
         if v7:
             self.last_recovery_wait_sec = 0.
+            self.last_recovery_deferred_queued = 0
+            self.last_recovery_deferred_consumed = 0
+            self.last_recovery_deferred_dropped = 0
 
         if v7 and teacher_history:
             raise ValueError("V7 uses only student actions")
@@ -400,6 +413,9 @@ class WarpCarryWorlds:
             e.rng = np.random.default_rng(seed + i)
             e.teacher_history, e.in_reset = teacher_history, False
             e._precomputed_recovery = _UNSET
+            e._recovery_snapshot = None
+            e._deferred_snapshot = None
+            e._clip_gpu = None
             # Only a few host arrays for the existing reset, teacher and recovery logic.
             shadow = SimpleNamespace(qpos=model.qpos0.copy(), qvel=np.zeros(model.nv),
                                      mocap_pos=np.zeros((model.nmocap, 3)))
@@ -490,6 +506,11 @@ class WarpCarryWorlds:
                 for future in self._recovery_futures.values():
                     future.cancel()
                 self._recovery_futures.clear()
+            deferred = getattr(self, "_deferred_recoveries", None)
+            if deferred is not None:
+                while deferred:
+                    future, _ = deferred.popleft()
+                    future.cancel()
             self._rec_pool = None
             pool.shutdown(wait=True)
 
@@ -563,23 +584,58 @@ class WarpCarryWorlds:
 
     def _prepare_recoveries(self, ids, source):
         futures = self._recovery_futures
+        defer_recovery = getattr(self, "_defer_recovery", False)
+        deferred = getattr(self, "_deferred_recoveries", None)
         missing = []
         for i in ids:
             e = self.envs[i]
+            e._clip_gpu = None
             attempt = source is None and e.pending_recovery
             future = None if futures is None else futures.get(i)
+            snap = getattr(e, "_recovery_snapshot", None)
             if future is not None:
                 if attempt:
-                    e._precomputed_recovery = self._recovery_result(future)
+                    if defer_recovery and not future.done():
+                        deferred.append((future, snap))
+                        e.pending_recovery = False
+                        e._precomputed_recovery = _UNSET
+                        self.last_recovery_deferred_queued += 1
+                    else:
+                        e._precomputed_recovery = self._recovery_result(future)
                 else:
                     future.cancel()
                 del futures[i]
+                e._recovery_snapshot = None
             elif attempt and e._precomputed_recovery is _UNSET:
+                e._recovery_snapshot = None
                 missing.append(i)
             if not attempt and (futures is not None or self._gpu_recovery):
                 # A caller can explicitly switch sources after an interrupted
                 # reset. Never reuse a ready plan from the abandoned episode.
                 e._precomputed_recovery = _UNSET
+                e._recovery_snapshot = None
+                if getattr(e, "_deferred_snapshot", None) is not None:
+                    e._deferred_snapshot = None
+        if defer_recovery and deferred and source is None:
+            free_slots = [i for i in ids if not self.envs[i].pending_recovery]
+            if free_slots:
+                remaining_q = deque()
+                take_idx = 0
+                while deferred:
+                    fut, snap = deferred.popleft()
+                    if take_idx < len(free_slots) and fut.done():
+                        plan = fut.result()
+                        if plan is not None:
+                            wid = free_slots[take_idx]
+                            take_idx += 1
+                            we = self.envs[wid]
+                            we.pending_recovery = True
+                            we._precomputed_recovery = plan
+                            we._deferred_snapshot = snap
+                            self.last_recovery_deferred_consumed += 1
+                    else:
+                        remaining_q.append((fut, snap))
+                deferred.extend(remaining_q)
         # Host-step callers and older versions can enter reset without a
         # prefetched plan. Keep their original synchronous/batched behavior.
         if len(missing) >= 2 and self._recovery_workers > 1:
@@ -610,14 +666,23 @@ class WarpCarryWorlds:
             if accepted:
                 if self._recovery_fk is None:
                     self._recovery_fk = BatchedRecoveryFK(accepted[0].root, self.device)
-                self._recovery_fk.complete([e._precomputed_recovery for e in accepted])
+                keep_gpu = bool(getattr(self, "_keep_recovery_on_device", False))
+                batch = [e._precomputed_recovery for e in accepted]
+                if keep_gpu:
+                    self._recovery_fk.complete(batch, keep_on_device=True)
+                else:
+                    self._recovery_fk.complete(batch)
                 for e in accepted:
                     plan = e._precomputed_recovery
                     e._precomputed_recovery = (plan.frames, plan.phase)
+                    e._clip_gpu = plan.gpu_frames if keep_gpu else None
 
     def reset(self, ids, source=None):
         if self.v7:
             self.last_recovery_wait_sec = 0.
+            if hasattr(self, "last_recovery_deferred_queued"):
+                self.last_recovery_deferred_queued = 0
+                self.last_recovery_deferred_consumed = 0
         ids = list(map(int, ids))
         if not ids:
             return
@@ -858,11 +923,34 @@ class WarpCarryWorlds:
             event_counts[f"{src}/timeout"] += int(is_timeout)
             event_counts[f"{src}/fallen"] += int(is_fallen)
             event_counts[f"{src}/recovered"] += int(is_success and e.source == "recovery")
+        if hasattr(self, "last_recovery_deferred_dropped"):
+            self.last_recovery_deferred_dropped = 0
         if rec_ids:
-            self._sync_worlds_to_host(rec_ids)
-            if self._recovery_futures is not None:
-                for i in rec_ids:
-                    self._recovery_futures[i] = self._submit_recovery(i)
+            if getattr(self, "_defer_recovery", False) and self._recovery_futures is not None:
+                budget = self._max_inflight_recoveries - len(self._recovery_futures) - len(self._deferred_recoveries)
+                if budget < len(rec_ids):
+                    drop_rec = rec_ids[max(0, budget):]
+                    rec_ids = rec_ids[:max(0, budget)]
+                    for i in drop_rec:
+                        self.envs[i].pending_recovery = False
+                    self.last_recovery_deferred_dropped += len(drop_rec)
+            if rec_ids:
+                self._sync_worlds_to_host(rec_ids)
+                if getattr(self, "_defer_recovery", False) and self._recovery_futures is not None:
+                    for i in rec_ids:
+                        e = self.envs[i]
+                        e._recovery_snapshot = {
+                            "qpos": e.d.qpos.copy(),
+                            "qvel": e.d.qvel.copy(),
+                            "mocap_pos": e.d.mocap_pos.copy(),
+                            "half": e.half.copy(),
+                            "goal": e.goal.copy(),
+                            "name": e.name,
+                        }
+                        self._recovery_futures[i] = self._submit_recovery(i)
+                elif self._recovery_futures is not None:
+                    for i in rec_ids:
+                        self._recovery_futures[i] = self._submit_recovery(i)
         if self.teacher_history:
             sync_ids = sorted(teacher_set) if teacher_ids is not None else list(range(self.num_envs))
             if sync_ids:

@@ -54,7 +54,19 @@ def reset_batch(world, ids, source):
 
     episodes = [world.envs[i] for i in ids]
     normal_rows = []
+    pose_episodes = []
     for row, e in enumerate(episodes):
+        snap = getattr(e, "_deferred_snapshot", None)
+        was_deferred = False
+        if snap is not None and source is None and e.pending_recovery:
+            e.d.qpos[:] = snap["qpos"]
+            e.d.qvel[:] = snap["qvel"]
+            e.d.mocap_pos[:] = snap["mocap_pos"]
+            e.half = snap["half"].copy()
+            e.goal = snap["goal"].copy()
+            e.name = snap["name"]
+            was_deferred = True
+        e._deferred_snapshot = None
         e._defer_main_pose = e.in_reset = True
         try:
             e.reset(source)
@@ -62,13 +74,15 @@ def reset_batch(world, ids, source):
             e._defer_main_pose = e.in_reset = False
         if e.source != "recovery":
             normal_rows.append(row)
+            pose_episodes.append(e)
+        elif was_deferred:
+            normal_rows.append(row)
         e.context[4:7] = world._geometry(e.half)["body_inertia"][world._box_body]
 
-    normal = [episodes[i] for i in normal_rows]
-    _normal_poses(normal)
-    variants = _geometry_table(world, normal)
+    _normal_poses(pose_episodes)
+    variants = _geometry_table(world, [episodes[i] for i in normal_rows])
     # Pack all per-episode float fields into a single H2D copy, including the
-    # live state of successful recoveries. MjWarp resets only the ordinary rows.
+    # live state of successful recoveries. MjWarp resets ordinary and deferred rows.
     model = world._host
     n = len(ids)
     dm = 3 * model.nmocap
@@ -84,7 +98,12 @@ def reset_batch(world, ids, source):
         host[3][row] = e.context
         host[4][row] = e._initial_box
         host[5][row] = e.goal
-        goal_bottom = float(e.goal[2] - np.abs(_matrix(e.clip[-1, 107:111])[2]) @ e.half)
+        cat = getattr(e, "_clip_catalogue", None)
+        if e.source != "recovery" and cat is not None and cat.last_box_extent_z is not None:
+            extent_z = cat.last_box_extent_z
+        else:
+            extent_z = float(np.abs(_matrix(e.clip[-1, 107:111])[2]) @ e.half)
+        goal_bottom = float(e.goal[2] - extent_z)
         tabletop = float(e.d.mocap_pos[world._table2_id, 2] + world._table2_half_z)
         ints[1:, row] = len(e.clip), e.index, e._lifted, abs(goal_bottom) < abs(goal_bottom - tabletop)
 
@@ -92,7 +111,7 @@ def reset_batch(world, ids, source):
     qp, qv, mocap, ctx, initial, goal = torch.tensor_split(buf, cuts[:-1], dim=1)
     idx, length, frame, held, floor = torch.as_tensor(ints, device=world.device).unbind(0)
     with wp.ScopedDevice(str(world.device)), world._stream():
-        if normal:
+        if normal_rows:
             norm, slots = torch.as_tensor(np.stack((normal_rows, variants)), device=world.device).unbind(0)
             changed = idx[norm]
             world._reset_mask_torch.zero_()

@@ -278,15 +278,29 @@ class PagedClipBank:
                     continue
             else:
                 slot = None
-            arr = np.ascontiguousarray(clip, dtype=np.float32)
-            if arr.ndim != 2 or arr.shape[1] != self.raw_dim or not len(arr):
-                raise ValueError(f"Expected a nonempty [T, {self.raw_dim}] clip, got {arr.shape}")
+            is_dev_tensor = torch.is_tensor(clip)
+            if is_dev_tensor:
+                if clip.ndim != 2 or clip.shape[1] != self.raw_dim or not len(clip):
+                    raise ValueError(f"Expected a nonempty [T, {self.raw_dim}] clip, got {tuple(clip.shape)}")
+                if static:
+                    arr = np.ascontiguousarray(clip.detach().cpu().numpy(), dtype=np.float32)
+                    values = None
+                else:
+                    values = clip.detach().to(device=self.device, dtype=torch.float32).contiguous()
+                    arr = None
+                n_frames = len(clip)
+            else:
+                arr = np.ascontiguousarray(clip, dtype=np.float32)
+                if arr.ndim != 2 or arr.shape[1] != self.raw_dim or not len(arr):
+                    raise ValueError(f"Expected a nonempty [T, {self.raw_dim}] clip, got {arr.shape}")
+                values = None
+                n_frames = len(arr)
             if static:
                 fingerprint = ClipBank._fingerprint(arr)
                 if slot is None:
                     slot = self._static_hashes.get(fingerprint)
             if slot is None:
-                count = (len(arr) + self.block_frames - 1) // self.block_frames
+                count = (n_frames + self.block_frames - 1) // self.block_frames
                 free = len(self._free_blocks) + len(self.pages) * self._blocks_per_page - self._next_block
                 # A full scan of replay is amortized across at least four pages of
                 # new trajectories, even if collecting a recovery on every tick.
@@ -297,7 +311,8 @@ class PagedClipBank:
                     self.reclaim(active_ids_fn(), extra=result)
                     swept = True
                     slot = self._free_slots[-1] if self._free_slots else len(self._slot_lengths)
-                values = torch.from_numpy(arr)
+                if values is None:
+                    values = torch.from_numpy(arr)
                 placed = self._try_device(slot, values, static)
                 if not placed and not swept and active_ids_fn is not None:
                     retired = self.reclaim(active_ids_fn(), extra=result)

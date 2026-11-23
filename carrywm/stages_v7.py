@@ -50,8 +50,8 @@ def _stage_labels(frames):
     return labels, int(both[-1])
 
 
-def _support_starts(frames, half, table_positions, table_half_sizes):
-    """Reject penetrating boxes and unsupported free-box starts in the shared scene."""
+def _clip_box_metadata(frames, half, table_positions, table_half_sizes):
+    """Compute admissible free-box starts, per-frame held-in-air flags, and final Z extent."""
     from .sim import _matrix
 
     centers = frames[:, 104:107]
@@ -61,14 +61,23 @@ def _support_starts(frames, half, table_positions, table_half_sizes):
     # solver/retargeting tolerance avoids rejecting contacts at rest.
     supported = abs(bottom) <= .012
     penetrates = bottom < -.012
+    on_support = bottom <= .005
     for pos, size in zip(table_positions, table_half_sizes):
         overlap = (abs(centers[:, :2] - pos[:2]) < size[:2] + extent[:, :2]).all(axis=1)
         above_slab = centers[:, 2] + extent[:, 2] > pos[2] - size[2]
         gap = bottom - (pos[2] + size[2])
         supported |= overlap & (abs(gap) <= .012)
         penetrates |= overlap & above_slab & (gap < -.012)
+        on_support |= overlap & (bottom <= pos[2] + size[2] + .005)
     two_hands = (frames[:, 37:39] > .5).all(axis=1)
-    return ~penetrates & (supported | two_hands)
+    starts_holding = two_hands & ~on_support
+    starts_holding[0] = False
+    return ~penetrates & (supported | two_hands), starts_holding, float(extent[-1, 2])
+
+
+def _support_starts(frames, half, table_positions, table_half_sizes):
+    """Reject penetrating boxes and unsupported free-box starts in the shared scene."""
+    return _clip_box_metadata(frames, half, table_positions, table_half_sizes)[0]
 
 
 def _angular_velocity(q):
@@ -98,6 +107,8 @@ class ClipStarts:
     labels: np.ndarray
     bins: tuple
     twists: np.ndarray | None
+    starts_holding: np.ndarray | None = None
+    last_box_extent_z: float | None = None
 
 
 class StageSampler:
@@ -125,14 +136,24 @@ class StageSampler:
         if key not in self._clips:
             from .geometry_v7 import valid_start_mask
             valid = np.asarray(valid_start_mask(root, frames, half, source, phase), dtype=bool).copy()
-            valid &= _support_starts(frames, half, table_positions, table_half_sizes)
+            support_valid, starts_holding, last_box_extent_z = _clip_box_metadata(
+                frames, half, table_positions, table_half_sizes
+            )
+            valid &= support_valid
             labels, final_grasp = _stage_labels(frames)
             # No suffix from a released box or starts with fewer than 8 real transitions.
             valid[min(final_grasp + 1, max(0, len(frames) - 8)):] = False
             indices = np.flatnonzero(valid)
             timed = _time_bin(indices, len(frames))
             bins = tuple(indices[timed == i] for i in range(BINS))
-            entry = ClipStarts(indices, labels, bins, generated_twists(frames) if source == "cfgen" else None)
+            entry = ClipStarts(
+                indices,
+                labels,
+                bins,
+                generated_twists(frames) if source == "cfgen" else None,
+                starts_holding=starts_holding,
+                last_box_extent_z=last_box_extent_z,
+            )
             self._clips[key] = (ref(frames, lambda _, k=key: self._clips.pop(k, None)), entry)
         return self._clips[key][1]
 

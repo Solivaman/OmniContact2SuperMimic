@@ -1,6 +1,8 @@
 """V3 training schedule for the MuJoCo carry-box world model and policy."""
 import argparse
 
+import torch
+
 from . import train as base
 from .v3 import LearnerV3
 
@@ -12,12 +14,25 @@ ACTOR_BATCH = 4096
 
 def wm_iteration(learner, replay, batch_size=WM_BATCH):
     """Each call to wm_update independently samples windows and steps Adam."""
+    if not hasattr(learner, "_wm_rollout_loss"):
+        totals = {}
+        for _ in range(WM_UPDATES):
+            metrics = learner.wm_update(replay, batch_size)
+            for name, value in metrics.items():
+                totals[name] = totals.get(name, 0.) + value
+        return {**{name: value / WM_UPDATES for name, value in totals.items()},
+                "wm/optimizer_steps": WM_UPDATES, "wm/windows_per_update": batch_size}
+
     totals = {}
-    for _ in range(WM_UPDATES):
-        metrics = learner.wm_update(replay, batch_size)
+    for step in range(WM_UPDATES):
+        metrics = learner.wm_update(
+            replay, batch_size, update_stats=(step == 0), defer_metrics=True
+        )
         for name, value in metrics.items():
-            totals[name] = totals.get(name, 0.) + value
-    return {**{name: value / WM_UPDATES for name, value in totals.items()},
+            totals[name] = value if name not in totals else (totals[name] + value)
+    keys = list(totals.keys())
+    vals = torch.stack([totals[k].float() for k in keys]).div_(WM_UPDATES).cpu().tolist()
+    return {**dict(zip(keys, vals)),
             "wm/optimizer_steps": WM_UPDATES, "wm/windows_per_update": batch_size}
 
 

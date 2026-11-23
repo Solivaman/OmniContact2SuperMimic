@@ -24,6 +24,7 @@ from .sim import _v7_recovery_plan, _valid_recovery_grasp
 class RecoverySkeleton:
     frames: np.ndarray
     phase: np.ndarray
+    gpu_frames: torch.Tensor | None = None
 
 
 def _rotate_one(q, v):
@@ -186,25 +187,48 @@ class BatchedRecoveryFK:
         return torch.cat((p, q), -1).float()
 
     @torch.no_grad()
-    def complete(self, plans):
+    def complete(self, plans, *, keep_on_device=False):
         if not plans:
             return
         raw = np.concatenate([np.concatenate((plan.frames[:, 39:68], plan.frames[:, 97:104]), -1)
                               for plan in plans])
         # Bound temporary memory independently of trajectory lengths and drop count.
         pieces = [self._link_poses(torch.as_tensor(raw[i:i+4096], device=self.device,
-                                                   dtype=torch.float64)).cpu().numpy()
+                                                   dtype=torch.float64))
                   for i in range(0, len(raw), 4096)]
-        poses = np.concatenate(pieces)
-        start = 0
-        for plan in plans:
-            end = start + len(plan.frames)
-            block = poses[start:end]
+        poses_gpu = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+        lengths = [len(plan.frames) for plan in plans]
+        blocks = poses_gpu.split(lengths, dim=0)
+        first_orig = torch.as_tensor(
+            np.stack([plan.frames[0, :35].reshape(5, 7)[:, 3:] for plan in plans]),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if keep_on_device:
+            tail_host = np.concatenate(
+                [np.ascontiguousarray(plan.frames[:, 35:], dtype=np.float32) for plan in plans],
+                axis=0,
+            )
+            tails_gpu = torch.as_tensor(tail_host, dtype=torch.float32, device=self.device).split(lengths, dim=0)
+        fixed_blocks = []
+        for idx, (plan, block) in enumerate(zip(plans, blocks)):
+            block = block.clone()
             quat = block[:, :, 3:]
-            signs = np.ones(quat.shape[:2], np.float32)
-            original_first = plan.frames[0, :35].reshape(5, 7)[:, 3:]
-            signs[0] = np.where((quat[0]*original_first).sum(-1) < 0, -1., 1.)
-            signs[1:] = np.where((quat[:-1]*quat[1:]).sum(-1) < 0, -1., 1.)
-            quat *= np.cumprod(signs, axis=0)[..., None]
-            plan.frames[:, :35] = block.reshape(-1, 35)
-            start = end
+            s0 = torch.where((quat[:1] * first_orig[idx:idx+1]).sum(-1) < 0, -1., 1.)
+            if len(quat) > 1:
+                s_next = torch.where((quat[:-1] * quat[1:]).sum(-1) < 0, -1., 1.)
+                signs = torch.cat((s0, s_next), dim=0)
+            else:
+                signs = s0
+            quat.mul_(torch.cumprod(signs, dim=0).unsqueeze(-1))
+            if keep_on_device:
+                plan.gpu_frames = torch.cat((block.reshape(-1, 35), tails_gpu[idx]), dim=1)
+            else:
+                fixed_blocks.append(block.reshape(-1, 35))
+                plan.gpu_frames = None
+        if not keep_on_device:
+            host_blocks = torch.cat(fixed_blocks, dim=0).cpu().numpy()
+            start = 0
+            for plan, n in zip(plans, lengths):
+                plan.frames[:, :35] = host_blocks[start:start + n]
+                start += n

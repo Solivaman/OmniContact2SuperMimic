@@ -77,3 +77,12 @@ python -m scripts.bench_v7_ik_queries --sim-root "$CARRY_SIM_ROOT" --motion-dir 
 | 窗口内训练进程显存峰值 | 18272 MiB | 13288 MiB |
 
 此窗口避开恢复预热、首次编译和定期评估。恢复后物理回合重新初始化，因此对比衡量这两次实际运行的综合速度。该窗口内训练吞吐提高 2.64 倍。第 250 轮留出评估中，NPZ 和 CF-Gen 的完整搬运成功率均为 0/6；上述结果证明了工程吞吐和稳定性的改善，控制效果仍需继续评估。
+
+## V7.2 吞吐与通信优化（基于 `v7.1-gpu-clipbank`）
+
+V7.2 在保持 V7 算法目标、网络结构、检查点 `state_dict` 键集合完全兼容的前提下，消除了剩余的 CPU/GPU 同步与等待瓶颈：
+
+1. **非阻塞延后在线恢复与高并发 IK 工人**：CPU 恢复工人默认上限提高到 `min(16, cpus // 2)` 并锁定单线程 BLAS；开启 `--defer-recovery`（默认）后，若重置时当前掉箱的 IK 未来对象尚未完成，不再阻塞 2048 环境，而是将快照入队、当前环境立即走常规阶段重置，待恢复规划在后续训练期间完成后由任意待重置世界接管并在 GPU 复原掉落现场物理状态与几何。
+2. **WM 掌心轻量化上身正运动学与同步收敛**：`CarryGeometry.palm_fk` 仅沿左右双掌到根的祖先子树用 `(R, t)` 组合计算（跳过下肢与 4×4 齐次矩阵拼装，全部新增 buffer 为 `persistent=False`）；`wm_iteration` 每轮仅第 1 个小批调用编译后的 `wm._features` 更新 `RunningNorm`，并把 10 步 WM 损失均值延迟到迭代末尾一次性 GPU→CPU 回传。
+3. **4 步分块编译展开与设备端恢复直写**：`_rollout` 通过 `_imagine_chunk` 每 4 步打包编译展开（32 步从 32 次 Python 派发减为 8 次）；`BatchedRecoveryFK.complete(..., keep_on_device=True)` 直接在 GPU 完成四元数符号连续化并产出完整 `[T, 111]` 设备张量，`PagedClipBank.register_many` 直接以设备内拷贝接管，省去 `poses` 往返主机与重新拼接开销。
+4. **轻量检查点与 12 路单波评估**：`StageSampler` 缓存静态片段的 `_starts_holding` 与末端 `extent_z`；V7 默认每 `50` 轮写轻量 `weights.pt`、每 `--full-save-every 200` 轮写含回放与优化器的全量 `latest.pt`；CPU 评估工人数默认提高到 `min(12, cpus // 2)` 并锁定单线程 BLAS。

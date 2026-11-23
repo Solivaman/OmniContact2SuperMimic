@@ -98,6 +98,9 @@ def configure(parser):
                         help='CPU worker processes for held-out MuJoCo evaluation')
     parser.add_argument('--cpu-threads', type=int, default=min(4, cpus),
                         help='PyTorch intra-op CPU threads for the main process')
+    parser.add_argument('--full-save-every', type=int, default=None,
+                        help='Write full resumable checkpoint (including replay/optimizers) every N iterations; '
+                             'intermediate --save-every points write lightweight weights.pt')
     parser.set_defaults(batch_size=ACTOR_BATCH, actor_microbatch=ACTOR_BATCH,
                         checkpoint_encoder=False, critic_chunk=16384,
                         warmup_steps=NUM_ENVS * base.WM_STEPS,
@@ -116,6 +119,8 @@ def args_from_cli(argv=None, *, configure_parser=configure, world_count=NUM_ENVS
         raise ValueError('The vector trainer uses on-policy warmup, zero CF-Gen goal noise and positive physical minibatches')
     if args.eval_workers < 1 or args.cpu_threads < 1:
         raise ValueError('eval-workers and cpu-threads must be positive')
+    if getattr(args, 'full_save_every', None) is not None and args.full_save_every < 1:
+        raise ValueError('full-save-every must be positive')
     if args.capacity // args.num_envs < base.WM_STEPS or torch.device(args.device).type != 'cuda':
         raise ValueError('The vector trainer requires CUDA and room for at least eight transitions per world')
     return args
@@ -221,12 +226,20 @@ def _run(args, version, learner_type):
     teacher_decay = int(getattr(args, 'teacher_decay_iters', 0))
     teacher_bc_weight = float(getattr(args, 'teacher_bc_weight', 0.0))
     teacher_bc_batch = int(getattr(args, 'teacher_bc_batch', 1024))
+    env_kwargs = {}
+    if version == 7:
+        env_kwargs = {
+            'v7': True,
+            'gpu_recovery': args.gpu_recovery,
+            'defer_recovery': getattr(args, 'defer_recovery', False),
+            'recovery_workers': getattr(args, 'recovery_workers', None),
+        }
     env = WarpCarryWorlds(
         args.sim_root, args.motion_dir, num_envs=args.num_envs,
         seed=args.seed + old_ticks, device=device, cfgen_ratio=args.cfgen_ratio,
         cfgen_cache_dir=args.cfgen_cache_dir, use_cuda_graph=args.cuda_graph,
         teacher_history=(teacher_init > 0.0 and first <= teacher_decay),
-        **({"v7": True, "gpu_recovery": args.gpu_recovery} if version == 7 else {}),
+        **env_kwargs,
     )
     if stage_state is not None:
         env.stage_sampler.load_state_dict(stage_state)
@@ -269,8 +282,25 @@ def _run(args, version, learner_type):
             peak_bytes=(peak_alloc, peak_reserved),
         )
 
-    def save(iteration):
-        checkpointer.save(lambda: make_payload(iteration), output / 'latest.pt')
+    full_save_every = getattr(args, 'full_save_every', None) or args.save_every
+
+    def make_weights_payload(iteration):
+        return dict(
+            version=version,
+            iteration=iteration,
+            elapsed=elapsed + time.monotonic() - start,
+            real_steps=old_steps + collector.steps,
+            control_ticks=old_ticks + collector.steps // args.num_envs,
+            models=[_cpu_clone(m.state_dict()) for m in net.models],
+            config=dict(config),
+            peak_bytes=(peak_alloc, peak_reserved),
+        )
+
+    def save(iteration, *, full=True):
+        if full:
+            checkpointer.save(lambda: make_payload(iteration), output / 'latest.pt')
+        else:
+            checkpointer.save(lambda: make_weights_payload(iteration), output / 'weights.pt')
 
     def warmup(minimum, *, update_normalizers, reason, episode_teacher_frac=0.0):
         initial_steps = collector.steps
@@ -307,7 +337,7 @@ def _run(args, version, learner_type):
             if env.teacher_history and ep_teacher <= 0.0:
                 env.teacher_history = False
             evaluate = args.eval_every and (iteration % args.eval_every == 0 or iteration == args.iterations)
-            should_save = iteration in (first, args.iterations) or iteration % args.save_every == 0
+            should_save = iteration in (first, args.iterations) or iteration % args.save_every == 0 or iteration % full_save_every == 0
             should_log = evaluate or iteration in (first, args.iterations) or iteration % args.log_every == 0
             if should_log:
                 base.sync(device)
@@ -377,7 +407,8 @@ def _run(args, version, learner_type):
                 stats.update(base.validate(net, args))
             if should_save:
                 phase = 'checkpoint'
-                save(iteration)
+                is_full_save = (iteration % full_save_every == 0) or (iteration == args.iterations)
+                save(iteration, full=is_full_save)
             if should_log:
                 stats['wall_seconds'] = elapsed + time.monotonic() - start
                 stats.update({f'collect/{k}': v for k, v in collector.episodes.items()})

@@ -31,6 +31,9 @@ class VectorCollector:
         )
         if self._gpu_fast:
             device = learner.device
+            if hasattr(env, "_keep_recovery_on_device"):
+                from .device_clips import PagedClipBank
+                env._keep_recovery_on_device = isinstance(replay.clip_bank, PagedClipBank)
             self._warm_static_clips()
             self.state_gpu = torch.empty((self.count, 84), dtype=torch.float32, device=device)
             self.context_gpu = torch.empty((self.count, 16), dtype=torch.float32, device=device)
@@ -69,8 +72,15 @@ class VectorCollector:
             self.world_is_teacher.fill(False)
         ids = np.flatnonzero(self.fresh)
         timing = {}
+        has_defer = hasattr(self.env, "last_recovery_deferred_queued")
         if hasattr(self.env, "last_recovery_wait_sec"):
             timing = {"sim/reset_sec_per_tick": 0., "sim/recovery_wait_sec_per_tick": 0.}
+        if has_defer:
+            timing.update({
+                "sim/recovery_deferred_queued_per_tick": 0.,
+                "sim/recovery_deferred_consumed_per_tick": 0.,
+                "sim/recovery_deferred_dropped_per_tick": 0.,
+            })
         if len(ids):
             if timing:
                 started = monotonic()
@@ -78,6 +88,9 @@ class VectorCollector:
             if timing:
                 timing["sim/reset_sec_per_tick"] = monotonic() - started
                 timing["sim/recovery_wait_sec_per_tick"] = self.env.last_recovery_wait_sec
+            if has_defer:
+                timing["sim/recovery_deferred_queued_per_tick"] = float(self.env.last_recovery_deferred_queued)
+                timing["sim/recovery_deferred_consumed_per_tick"] = float(self.env.last_recovery_deferred_consumed)
             if episode_teacher_frac > 0.0:
                 k_teacher = int(round(episode_teacher_frac * self.count))
                 self.world_is_teacher[ids] = ids < k_teacher
@@ -93,8 +106,16 @@ class VectorCollector:
             self.context_gpu.index_copy_(0, idx_t, self.env._context_gpu.index_select(0, idx_t))
             self.previous_gpu[idx_t] = 0.0
             self.frames_gpu.index_copy_(0, idx_t, self.env._env_index.index_select(0, idx_t))
+            clip_inputs = []
+            for i in ids:
+                gpu_clip = getattr(envs[i], "_clip_gpu", None)
+                if gpu_clip is not None:
+                    clip_inputs.append(gpu_clip)
+                    envs[i]._clip_gpu = None
+                else:
+                    clip_inputs.append(envs[i].clip)
             new_clip_ids = self.replay.register_clips(
-                [envs[i].clip for i in ids], static=False,
+                clip_inputs, static=False,
                 extra_active_ids=self.clip_ids_gpu if self.steps > 0 else None,
             )
             self.clip_ids_gpu.index_copy_(0, idx_t, new_clip_ids)
@@ -160,6 +181,8 @@ class VectorCollector:
         after_gpu, contacts_gpu, done_np, event_counts, drops = self.env.step_gpu(
             actions, next_ref=target, teacher_ids=teacher_ids if len(teacher_ids) else None
         )
+        if has_defer:
+            timing["sim/recovery_deferred_dropped_per_tick"] = float(self.env.last_recovery_deferred_dropped)
         self.episodes.update(event_counts)
         self.replay.append_gpu(
             self.state_gpu, after_gpu, self.previous_gpu, actions, contacts_gpu,
