@@ -1,6 +1,7 @@
 """Exercise the vector collector contract with two worlds and asynchronous resets."""
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 import unittest
 
 import numpy as np
@@ -87,6 +88,11 @@ class VectorCollectorTests(unittest.TestCase):
         self.assertEqual(replay.states[2, 0, 0], 200)
         np.testing.assert_array_equal(env.actions[0], np.zeros((2, 29)))
         self.assertFalse(np.allclose(env.actions[1], 0))
+        # Diagnostics can be disabled without losing the actual transition.
+        with patch.object(geo, "reward_terms", side_effect=AssertionError("unexpected logging FK")):
+            metrics = collector.one_tick(noise=0., record_reward=False)
+        self.assertNotIn("sim/reward", metrics)
+        np.testing.assert_array_equal(replay.actions[3], env.actions[3] + 1)
         np.testing.assert_array_equal(replay.actions[1], env.actions[1] + 1)
 
 

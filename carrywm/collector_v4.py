@@ -1,6 +1,7 @@
 """One batched policy call and one batched physical control step per vector tick."""
 from collections import Counter
 from functools import partial
+from time import monotonic
 
 import numpy as np
 import torch
@@ -53,22 +54,30 @@ class VectorCollector:
 
     @torch.no_grad()
     def one_tick(self, teacher_prob=0., noise=0., update_normalizers=False, defer_reward=False,
-                 episode_teacher_frac=0.0):
+                 episode_teacher_frac=0.0, *, record_reward=True):
         if self._gpu_fast:
             return self._one_tick_gpu(
-                teacher_prob, noise, update_normalizers, defer_reward, episode_teacher_frac
+                teacher_prob, noise, update_normalizers, defer_reward, episode_teacher_frac, record_reward
             )
-        return self._one_tick_cpu(teacher_prob, noise, update_normalizers)
+        return self._one_tick_cpu(teacher_prob, noise, update_normalizers, record_reward)
 
     def _one_tick_gpu(self, teacher_prob, noise, update_normalizers, defer_reward,
-                      episode_teacher_frac=0.0):
+                      episode_teacher_frac=0.0, record_reward=True):
         envs, net = self.env.envs, self.net
         device = net.device
         if episode_teacher_frac <= 0.0:
             self.world_is_teacher.fill(False)
         ids = np.flatnonzero(self.fresh)
+        timing = {}
+        if hasattr(self.env, "last_recovery_wait_sec"):
+            timing = {"sim/reset_sec_per_tick": 0., "sim/recovery_wait_sec_per_tick": 0.}
         if len(ids):
+            if timing:
+                started = monotonic()
             self.env.reset(ids)
+            if timing:
+                timing["sim/reset_sec_per_tick"] = monotonic() - started
+                timing["sim/recovery_wait_sec_per_tick"] = self.env.last_recovery_wait_sec
             if episode_teacher_frac > 0.0:
                 k_teacher = int(round(episode_teacher_frac * self.count))
                 self.world_is_teacher[ids] = ids < k_teacher
@@ -157,20 +166,22 @@ class VectorCollector:
             self.context_gpu, obs, self.frames_gpu, self.clip_ids_gpu, fresh_t,
             is_teacher=teacher_mask_t,
         )
-        terms = net.geo.reward_terms(
-            self.state_gpu, after_gpu, self.previous_gpu, actions, target, contacts_gpu
-        )
-        reward_t = sum(term.mean() for term in terms.values()) - net.args.drop_penalty * drops / self.count
-        reward = reward_t if defer_reward else reward_t.item()
+        metrics = {"sim/teacher_fraction": teacher_frac, **timing}
+        if record_reward:
+            terms = net.geo.reward_terms(
+                self.state_gpu, after_gpu, self.previous_gpu, actions, target, contacts_gpu
+            )
+            reward = sum(term.mean() for term in terms.values()) - net.args.drop_penalty * drops / self.count
+            metrics["sim/reward"] = reward if defer_reward else reward.item()
 
         self.fresh = done_np
         self.state_gpu.copy_(after_gpu)
         self.previous_gpu.copy_(actions)
         self.frames_gpu.copy_(self.env._env_index)
         self.steps += self.count
-        return {"sim/teacher_fraction": teacher_frac, "sim/reward": reward}
+        return metrics
 
-    def _one_tick_cpu(self, teacher_prob, noise, update_normalizers):
+    def _one_tick_cpu(self, teacher_prob, noise, update_normalizers, record_reward=True):
         envs, net, fresh = self.env.envs, self.net, self.fresh
         ids = np.flatnonzero(fresh)
         if len(ids):
@@ -232,12 +243,14 @@ class VectorCollector:
             net.wm.update_stats(state, action, ctx)
         self.replay.append(self.state, after, self.previous, executed, contacts, self.context,
                            obs.cpu().numpy(), frames, clips, fresh)
-        target = gather_reference(clips, frames, (1,))[:, 0]
-        terms = net.geo.reward_terms(state, as_tensor(after), previous, action,
-                                     as_tensor(target), as_tensor(contacts))
-        reward = sum(term.mean() for term in terms.values()).item() - net.args.drop_penalty * drops / self.count
+        metrics = {"sim/teacher_fraction": len(teacher_ids) / self.count}
+        if record_reward:
+            target = gather_reference(clips, frames, (1,))[:, 0]
+            terms = net.geo.reward_terms(state, as_tensor(after), previous, action,
+                                         as_tensor(target), as_tensor(contacts))
+            metrics["sim/reward"] = sum(term.mean() for term in terms.values()).item() - net.args.drop_penalty * drops / self.count
         self.fresh = done.copy()
         self.state[:] = after
         self.previous = executed
         self.steps += self.count
-        return {"sim/teacher_fraction": len(teacher_ids) / self.count, "sim/reward": reward}
+        return metrics

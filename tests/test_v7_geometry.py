@@ -1,6 +1,7 @@
 """Physical G1 carry checks for side selection, interpolation and reset admission."""
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 import mujoco as mj
 import numpy as np
@@ -9,7 +10,7 @@ import pytest
 from carrywm.data import load_demo
 from carrywm.geometry_v7 import (CONTACT_GAP, LEG_CLEARANCE, MAX_PENETRATION, _faces,
                                  _opposed_side_error, _probe, generate_v7_clip, valid_start_mask)
-from carrywm.sim import _matrix
+from carrywm.sim import _matrix, _valid_recovery_grasp
 
 
 @pytest.fixture(scope="module")
@@ -58,6 +59,8 @@ def test_intermediate_grasp_and_lowering_on_rotated_boxes(scene, yaw, roll):
     box[3:] = box_rotation(yaw, roll)
     frames, phase = generate_v7_clip(root, initial[97:104], box, demo.half, demo.frames[-1, 104:107])
     valid = valid_start_mask(root, frames, demo.half, "cfgen", phase)
+    first_grasp = np.flatnonzero((frames[:, 37:39] > .5).all(axis=1))[0]
+    assert _valid_recovery_grasp(root, frames, demo.half, phase) == valid[first_grasp]
     probe = _probe(root, tuple(demo.half))
     face = _faces(box, demo.half, initial[97:100])[0]
     target = np.array([face["local_left"], -face["local_left"]])
@@ -110,6 +113,36 @@ def test_npz_filter_reads_original_demo_without_modifying_it(scene):
     assert mask.shape == (len(frozen),) and mask.dtype == np.bool_
     assert mask.any() and not mask.all()
     assert frozen.tobytes() == before
+
+
+def test_recovery_check_preserves_face_and_foot_anchors(scene):
+    root, demo = scene
+    init = demo.frames[0]
+    frames, phases = generate_v7_clip(root, init[97:104], init[104:111], demo.half,
+                                      demo.frames[-1, 104:107])
+    mask = valid_start_mask(root, frames, demo.half, "cfgen", phases)
+    probe = _probe(root, tuple(demo.half))
+    for planted_phase in (21, 24):
+        grasp = np.flatnonzero(mask & (phases.ravel() == planted_phase)
+                               & (frames[:, 37:39] > .5).all(axis=1))[0]
+        # The initial pose defines the target faces. Frame 1 defines the planted
+        # feet. Frame 48 is the first grasp, after a long noncontact lead-in.
+        base = np.repeat(frames[grasp:grasp + 1], 96, axis=0)
+        base[0] = frames[0]
+        base[:48, 37:39] = 0.
+        phase = np.full((len(base), 1), planted_phase)
+        phase[0] = 11
+        slipped = base.copy()
+        slipped[1, 97] += .1
+        wrong_side = base.copy()
+        wrong_side[0, 97:99] = 2 * base[0, 104:106] - base[0, 97:99]
+        for clip, expected in ((base, True), (slipped, False), (wrong_side, False)):
+            assert bool(valid_start_mask(root, clip, demo.half, "cfgen", phase)[48]) == expected
+            with patch.object(probe, "distances", wraps=probe.distances) as inspections:
+                assert _valid_recovery_grasp(root, clip, demo.half, phase) == expected
+            assert inspections.call_count <= 3
+    base[:, 37:39] = 0.
+    assert not _valid_recovery_grasp(root, base, demo.half, phase)
 
 
 @pytest.mark.parametrize("root_z,waist", [(.805, .10), (.75, -.08)])

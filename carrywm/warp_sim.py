@@ -8,6 +8,7 @@ import hashlib
 import multiprocessing as mp
 import os
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
 import warnings
 import weakref
@@ -355,6 +356,10 @@ class WarpCarryWorlds:
             recovery_workers if recovery_workers is not None
             else min(8, max(1, (os.cpu_count() or 2) // 4))
         )
+        self.v7 = v7
+        self._recovery_futures = {} if v7 and self.device.type == "cuda" and self._recovery_workers > 0 else None
+        if v7:
+            self.last_recovery_wait_sec = 0.
 
         if v7 and teacher_history:
             raise ValueError("V7 uses only student actions")
@@ -466,6 +471,10 @@ class WarpCarryWorlds:
     def close(self):
         pool = getattr(self, "_rec_pool", None)
         if pool is not None:
+            if self._recovery_futures is not None:
+                for future in self._recovery_futures.values():
+                    future.cancel()
+                self._recovery_futures.clear()
             self._rec_pool = None
             pool.shutdown(wait=True)
 
@@ -517,26 +526,70 @@ class WarpCarryWorlds:
             e.d.qvel[:] = qv[k]
             e.index = int(frames[k])
 
+    def _submit_recovery(self, i):
+        e = self.envs[i]
+        # The process pool serializes arguments on a background thread. Take
+        # private copies before the host arrays can be reused by any reset.
+        return self._ensure_rec_pool().submit(
+            _recovery_worker, str(e.root), e.d.qpos[:7].copy(), e.d.qpos[e.bp:e.bp + 7].copy(),
+            e.half.copy(), e.goal.copy(), e.v7,
+        )
+
+    def _recovery_result(self, future):
+        if not self.v7 or future.done():
+            return future.result()
+        start = perf_counter()
+        try:
+            return future.result()
+        finally:
+            self.last_recovery_wait_sec += perf_counter() - start
+
+    def _prepare_recoveries(self, ids, source):
+        futures = self._recovery_futures
+        missing = []
+        for i in ids:
+            e = self.envs[i]
+            attempt = source is None and e.pending_recovery
+            future = None if futures is None else futures.get(i)
+            if future is not None:
+                if attempt:
+                    e._precomputed_recovery = self._recovery_result(future)
+                else:
+                    future.cancel()
+                del futures[i]
+            elif attempt and e._precomputed_recovery is _UNSET:
+                missing.append(i)
+            if not attempt and futures is not None:
+                # A caller can explicitly switch sources after an interrupted
+                # reset. Never reuse a ready plan from the abandoned episode.
+                e._precomputed_recovery = _UNSET
+        # Host-step callers and older versions can enter reset without a
+        # prefetched plan. Keep their original synchronous/batched behavior.
+        if len(missing) >= 2 and self._recovery_workers > 1:
+            self._sync_worlds_to_host(missing)
+            batch = [self._submit_recovery(i) for i in missing]
+            for i, future in zip(missing, batch):
+                self.envs[i]._precomputed_recovery = self._recovery_result(future)
+        elif missing and self.v7:
+            # Synchronous V7 fallback (e.g. an explicitly disabled pool).
+            start = perf_counter()
+            try:
+                for i in missing:
+                    e = self.envs[i]
+                    e._precomputed_recovery = (e.clip, e.phase) if e._try_recovery() else None
+            finally:
+                self.last_recovery_wait_sec += perf_counter() - start
+
     def reset(self, ids, source=None):
+        if self.v7:
+            self.last_recovery_wait_sec = 0.
         ids = list(map(int, ids))
         if not ids:
             return
         if len(set(ids)) != len(ids) or min(ids) < 0 or max(ids) >= self.num_envs:
             raise ValueError("Invalid or duplicate world IDs")
 
-        if source is None:
-            rec_ids = [i for i in ids if self.envs[i].pending_recovery]
-            if len(rec_ids) >= 2 and self._recovery_workers > 1:
-                self._sync_worlds_to_host(rec_ids)
-                pool = self._ensure_rec_pool()
-                futs = []
-                for i in rec_ids:
-                    e = self.envs[i]
-                    root = e.d.qpos[:7].copy()
-                    box = e.d.qpos[e.bp:e.bp + 7].copy()
-                    futs.append(pool.submit(_recovery_worker, str(e.root), root, box, e.half.copy(), e.goal.copy(), e.v7))
-                for i, fut in zip(rec_ids, futs):
-                    self.envs[i]._precomputed_recovery = fut.result()
+        self._prepare_recoveries(ids, source)
 
         new = []
         variants = []
@@ -769,6 +822,9 @@ class WarpCarryWorlds:
             event_counts[f"{src}/recovered"] += int(is_success and e.source == "recovery")
         if rec_ids:
             self._sync_worlds_to_host(rec_ids)
+            if self._recovery_futures is not None:
+                for i in rec_ids:
+                    self._recovery_futures[i] = self._submit_recovery(i)
         if self.teacher_history:
             sync_ids = sorted(teacher_set) if teacher_ids is not None else list(range(self.num_envs))
             if sync_ids:

@@ -78,13 +78,33 @@ def _teacher(root):
     return ort.InferenceSession(str(path), opts, providers=["CPUExecutionProvider"])
 
 
+def _valid_recovery_grasp(root, frames, half, phase):
+    """Evaluate the full-clip admission rule at the first bilateral grasp only."""
+    from .geometry_v7 import valid_start_mask
+
+    grasp = np.flatnonzero((frames[:, 37:39] > .5).all(axis=1))
+    if not len(grasp):
+        return False
+    index = int(grasp[0])
+    if phase is None:
+        return bool(valid_start_mask(root, frames[index:index + 1], half, "recovery")[0])
+
+    phase = np.asarray(phase).ravel()
+    # Keep the original face-selection frame, and the foot anchor for a planted
+    # phase. All remaining checks use only the state at the tested frame.
+    rows = [0, index]
+    if phase[index] in (21, 24):
+        rows.append(np.flatnonzero(phase == phase[index])[0])
+    rows = np.unique(rows)  # both anchors are at or before the first grasp
+    return bool(valid_start_mask(root, frames[rows], half, "recovery", phase[rows])[-1])
+
+
 def _v7_recovery_plan(sim_root, root, box, half, goal):
-    from .geometry_v7 import generate_v7_clip, valid_start_mask
+    from .recovery_fk_v7 import generate_recovery_clip
 
     try:
-        frames, phase = generate_v7_clip(sim_root, root, box, half, goal)
-        grasp = np.flatnonzero((frames[:, 37:39] > .5).all(axis=1))
-        if len(grasp) and valid_start_mask(sim_root, frames, half, "cfgen", phase)[grasp[0]]:
+        frames, phase = generate_recovery_clip(sim_root, root, box, half, goal)
+        if _valid_recovery_grasp(sim_root, frames, half, phase):
             return frames, phase
     except (ValueError, FloatingPointError, np.linalg.LinAlgError):
         pass

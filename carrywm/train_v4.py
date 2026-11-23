@@ -254,7 +254,8 @@ def _run(args, version, learner_type):
         initial_steps = collector.steps
         while collector.steps - initial_steps < minimum or not replay.has_window(base.WM_STEPS):
             collector.one_tick(noise=args.action_noise, update_normalizers=update_normalizers,
-                               defer_reward=True, episode_teacher_frac=episode_teacher_frac)
+                               defer_reward=True, episode_teacher_frac=episode_teacher_frac,
+                               record_reward=(version != 7))
             if collector.steps - initial_steps >= max(args.capacity, minimum) and not replay.has_window(base.WM_STEPS):
                 raise RuntimeError('Warmup produced no continuous eight-step trajectory in any world')
         base.sync(device)
@@ -292,7 +293,7 @@ def _run(args, version, learner_type):
             while not updates:
                 for key, value in collector.one_tick(
                     noise=args.action_noise, defer_reward=not should_log,
-                    episode_teacher_frac=ep_teacher,
+                    episode_teacher_frac=ep_teacher, record_reward=(version != 7 or should_log),
                 ).items():
                     totals[key] = totals.get(key, 0.) + value
                 updates = clock.tick()
