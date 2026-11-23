@@ -164,6 +164,20 @@ def _probe(root, half):
 
 class _CarryGeometry:
     """V7 overrides the official generator's grasp placement and interpolation."""
+    def _solve_fixed_feet_hand_ik(self, *, pelvis_pos, seed_joint_pos, **kwargs):
+        from policy.omnicontact.CFgen_meta1_loco import DEFAULT_PELVIS_Z
+
+        # The official IK clips the seed to MJCF joint ranges, then applies a
+        # tighter waist-pitch lower bound. A preceding V7 knot can end below it.
+        # The lowering phase also seeds root height from the end of the carry.
+        pelvis = np.asarray(pelvis_pos, dtype=np.float64).copy()
+        pelvis[2] = min(pelvis[2], DEFAULT_PELVIS_Z)
+        joints = np.asarray(seed_joint_pos, dtype=np.float64).copy()
+        active = kwargs.get("ik_joint_indices")
+        if 14 in (self.cfg["ik_joint_indices"] if active is None else active):
+            joints[14] = max(joints[14], kwargs.get("waist_pitch_min_rad", 0.))
+        return super()._solve_fixed_feet_hand_ik(pelvis_pos=pelvis, seed_joint_pos=joints, **kwargs)
+
     def _get_target_face_info(self, obj_pos, obj_quat, pelvis_pos, dims):
         return _faces(np.r_[obj_pos, obj_quat], dims, pelvis_pos)
 

@@ -110,3 +110,42 @@ def test_npz_filter_reads_original_demo_without_modifying_it(scene):
     assert mask.shape == (len(frozen),) and mask.dtype == np.bool_
     assert mask.any() and not mask.all()
     assert frozen.tobytes() == before
+
+
+@pytest.mark.parametrize("root_z,waist", [(.805, .10), (.75, -.08)])
+def test_phase24_ik_projects_only_invalid_seed_components(scene, monkeypatch, root_z, waist):
+    import scipy.optimize
+    from carrywm.geometry_v7 import _v7_type
+    from carrywm.sim import _generator
+
+    root, demo = scene
+    base = _generator(root)
+    v7 = _v7_type(root)()
+    frame = demo.frames[0]
+    pelvis = frame[97:100].copy()
+    pelvis[2] = root_z
+    joints = frame[39:68].copy()
+    joints[14] = waist
+    inputs = dict(pelvis_pos=pelvis, pelvis_quat=frame[100:104], seed_joint_pos=joints,
+                  ik_joint_indices=np.arange(29), waist_pitch_min_rad=.06,
+                  left_ankle_pos=frame[21:24], left_ankle_quat=frame[24:28],
+                  right_ankle_pos=frame[28:31], right_ankle_quat=frame[31:35],
+                  left_palm_pos=frame[:3], right_palm_pos=frame[7:10])
+    measured = []
+    solve = scipy.optimize.least_squares
+
+    def measure(fun, x0, *, bounds, **kwargs):
+        measured.append((x0.copy(), *[b.copy() for b in bounds]))
+        return solve(fun, x0, bounds=bounds, **kwargs)
+
+    monkeypatch.setattr(scipy.optimize, "least_squares", measure)
+    with pytest.raises(ValueError, match="(?i)(initial guess|x0)"):
+        base._solve_fixed_feet_hand_ik(**inputs)
+    result = v7._solve_fixed_feet_hand_ik(**inputs)
+    original, lower, upper = measured[0]
+    corrected, actual_lower, actual_upper = measured[1]
+    np.testing.assert_array_equal(actual_lower, lower)
+    np.testing.assert_array_equal(actual_upper, upper)
+    np.testing.assert_array_equal(corrected, np.clip(original, lower, upper))
+    assert np.isfinite(np.concatenate(result)).all()
+    assert pelvis[2] == np.float32(root_z) and joints[14] == np.float32(waist)
