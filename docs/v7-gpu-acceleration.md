@@ -86,3 +86,22 @@ V7.2 在保持 V7 算法目标、网络结构、检查点 `state_dict` 键集合
 2. **WM 掌心轻量化上身正运动学与同步收敛**：`CarryGeometry.palm_fk` 仅沿左右双掌到根的祖先子树用 `(R, t)` 组合计算（跳过下肢与 4×4 齐次矩阵拼装，全部新增 buffer 为 `persistent=False`）；`wm_iteration` 每轮仅第 1 个小批调用编译后的 `wm._features` 更新 `RunningNorm`，并把 10 步 WM 损失均值延迟到迭代末尾一次性 GPU→CPU 回传。
 3. **4 步分块编译展开与设备端恢复直写**：`_rollout` 通过 `_imagine_chunk` 每 4 步打包编译展开（32 步从 32 次 Python 派发减为 8 次）；`BatchedRecoveryFK.complete(..., keep_on_device=True)` 直接在 GPU 完成四元数符号连续化并产出完整 `[T, 111]` 设备张量，`PagedClipBank.register_many` 直接以设备内拷贝接管，省去 `poses` 往返主机与重新拼接开销。
 4. **轻量检查点与 12 路单波评估**：`StageSampler` 缓存静态片段的 `_starts_holding` 与末端 `extent_z`；V7 默认每 `50` 轮写轻量 `weights.pt`、每 `--full-save-every 200` 轮写含回放与优化器的全量 `latest.pt`；CPU 评估工人数默认提高到 `min(12, cpus // 2)` 并锁定单线程 BLAS。
+
+### RTX 3090 的 12 个恢复工人续训配置
+
+`v7.2-r12` 保存了 2026-11-23 的正式续训配置。训练代码对应 `f4561ffa6d74ba4b1315fa68cef4699aec1612fa`。这次从 V7.2 第 2200 轮的完整检查点恢复，将恢复工人数从自动选出的 16 改为 12。每 250 轮仍用 12 个评估工人运行 NPZ 和 CF-Gen 各 6 局。服务器导出的[完整运行配置](v7.2-r12-run.json)包含全部超参数、软件版本和原始路径。
+
+在配置好 V7.2 仿真依赖的环境中，从仓库根目录运行下面的命令。将 `CARRY_ROOT` 设为包含仿真项目和数据集的目录，`V72_CHECKPOINT` 指向第 2200 轮的完整检查点，`RUN_DIR` 指向新的输出目录。已有的续训日志保存在 `v7-runs/v7.2-speed-f4561ff-seed42-r12-from2200`。
+
+```bash
+python -u -m carrywm.monitor --output-dir "${RUN_DIR:?}" --gpu 0 --interval 2 -- \
+  python -u -m carrywm.train_v7 \
+  --sim-root "${CARRY_ROOT:?}/OmniContact_sim2sim" \
+  --motion-dir "$CARRY_ROOT/OmniContact/assets/data/box/case1_carry" \
+  --cfgen-cache-dir "$CARRY_ROOT/.cache/carrywm" \
+  --output-dir "$RUN_DIR" --resume "${V72_CHECKPOINT:?}" \
+  --device cuda:0 --precision bf16 --seed 42 --iterations 4000 \
+  --recovery-workers 12 --eval-workers 12 --cpu-threads 4 \
+  --eval-every 250 --eval-episodes 6 --save-every 50 --full-save-every 200 --log-every 5 \
+  --gpu-recovery --fused-rotations --defer-recovery --clip-storage device --clip-budget-gib 11
+```
