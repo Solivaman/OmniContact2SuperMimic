@@ -1,4 +1,6 @@
-# V7 · Unitree G1 无教师搬箱
+# V7.1 · GPU 分页参考库
+
+本版在 Unitree G1 无教师搬箱训练中，将示范和在线恢复参考按页放入 GPU，默认上限为 11 GiB。[V7.1 实现与 RTX 3090 实测](docs/v7-gpu-acceleration.md)
 
 V7 用 OmniContact 的搬箱参考训练一个新的 CF-Track MLP。当前策略加探索噪声在 MuJoCo Warp 中采集动作和下一状态，世界模型用这些转移学习动力学。Actor 再从 replay 的真实状态出发，在冻结参数的世界模型中展开 32 步，通过奖励梯度学习。策略从随机初始化开始，预热和正式采集均由它控制。
 
