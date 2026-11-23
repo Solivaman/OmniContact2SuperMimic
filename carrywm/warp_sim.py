@@ -27,6 +27,7 @@ from .sim import (
     _generator,
     _matrix,
     _scene,
+    _v7_recovery_plan,
 )
 
 
@@ -141,15 +142,20 @@ def _init_cpu_worker():
     torch.set_num_threads(1)
 
 
-def _cfgen_plan_worker(root_str, pose, box, half, goal):
+def _cfgen_plan_worker(root_str, pose, box, half, goal, v7=False):
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    if v7:
+        from .geometry_v7 import generate_v7_clip
+        return generate_v7_clip(Path(root_str), pose, box, half, goal)
     return generate_clip(_generator(Path(root_str)),
                          np.asarray(pose), np.asarray(box),
                          np.asarray(half, dtype=float), np.asarray(goal, dtype=np.float32))
 
 
-def _recovery_worker(root_str, root_pose, box_pose, half, goal):
+def _recovery_worker(root_str, root_pose, box_pose, half, goal, v7=False):
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    if v7:
+        return _v7_recovery_plan(Path(root_str), root_pose, box_pose, half, goal)
     gen = _generator(Path(root_str))
     try:
         frames, phase = generate_clip(gen, root_pose, box_pose, half, goal)
@@ -179,14 +185,19 @@ def _plan_key(pose, box, half, goal):
     )
 
 
-def _make_plan(root, pose, box, half, goal):
+def _make_plan(root, pose, box, half, goal, v7=False):
     # Official carry IK uses deterministic inputs. Cache only the zero-noise plans.
+    if v7:
+        from .geometry_v7 import generate_v7_clip
+        return generate_v7_clip(root, *(np.asarray(x) for x in (pose, box, half, goal)))
     return generate_clip(_generator(root), *(np.asarray(x) for x in (pose, box, half, goal)))
 
 
-def _cache_signature(root, table2_size_xy, paths):
+def _cache_signature(root, table2_size_xy, paths, v7=False):
     h = hashlib.sha256()
     h.update(str(root).encode("utf-8"))
+    if v7:
+        h.update(Path(__file__).with_name("geometry_v7.py").read_bytes())
     h.update(np.asarray(table2_size_xy, dtype=np.float64).tobytes())
     for rel in ("policy/omnicontact/CFgen_meta2_carrybox.py", "policy/omnicontact/CFgen_builder.py"):
         p = root / rel
@@ -223,7 +234,7 @@ def _warm_cfgen_cache(prototype, table2_geom, model, cache_dir, plan_workers):
     cache_root = Path(cache_dir) if cache_dir is not None else Path(
         os.environ.get("CARRYWM_CACHE_DIR", Path.home() / ".cache" / "carrywm")
     )
-    sig = _cache_signature(prototype.root, table2_size, prototype.paths)
+    sig = _cache_signature(prototype.root, table2_size, prototype.paths, prototype.v7)
     cache_path = cache_root / f"cfgen_zero_noise_{sig}.npz"
 
     if cache_path.exists():
@@ -245,11 +256,11 @@ def _warm_cfgen_cache(prototype, table2_geom, model, cache_dir, plan_workers):
         ctx = mp.get_context("spawn")
         with ProcessPoolExecutor(max_workers=min(workers, len(specs)), mp_context=ctx,
                                  initializer=_init_cpu_worker) as pool:
-            futs = [pool.submit(_cfgen_plan_worker, str(prototype.root), pose, box, half, goal)
+            futs = [pool.submit(_cfgen_plan_worker, str(prototype.root), pose, box, half, goal, prototype.v7)
                     for _, pose, box, half, goal in specs]
             results = [f.result() for f in futs]
     else:
-        results = [_make_plan(prototype.root, pose, box, half, goal)
+        results = [_make_plan(prototype.root, pose, box, half, goal, prototype.v7)
                    for _, pose, box, half, goal in specs]
 
     payload = {"count": np.array([len(specs)], dtype=np.int64)}
@@ -278,7 +289,7 @@ class _Episode(CarryEnv):
     def _load_scene(self, path):
         # One packed SceneClip per selected source file across all worlds.
         if path not in self.scenes:
-            self.scenes[path] = load_demo(path)
+            self.scenes[path] = super()._load_scene(path)
         return self.scenes[path]
 
     def _bind_scene(self, half):
@@ -299,7 +310,7 @@ class _Episode(CarryEnv):
             return cached
         return self.reference_plan(self.root, tuple(scene.frames[0, 97:104]),
                                    tuple(scene.frames[0, 104:111]),
-                                   tuple(self.half), tuple(self.goal))
+                                   tuple(self.half), tuple(self.goal), self.v7)
 
     def _try_recovery(self):
         pre = getattr(self, "_precomputed_recovery", _UNSET)
@@ -327,7 +338,7 @@ class WarpCarryWorlds:
     def __init__(self, sim_root, motion_dir, num_envs, seed=42, split="train", cfgen_ratio=.1,
                  cfgen_goal_noise_std_m=0., device="cuda:0", nconmax=64, njmax=256,
                  teacher_history=False, cfgen_cache_dir=None, plan_workers=None,
-                 recovery_workers=None, use_cuda_graph=True):
+                 recovery_workers=None, use_cuda_graph=True, v7=False):
         if num_envs < 1 or nconmax < 1 or njmax < 1:
             raise ValueError("World count and contact/constraint capacities must be positive")
         self.num_envs = num_envs
@@ -345,7 +356,10 @@ class WarpCarryWorlds:
             else min(8, max(1, (os.cpu_count() or 2) // 4))
         )
 
-        prototype = _Episode(sim_root, motion_dir, seed, split, cfgen_ratio, cfgen_goal_noise_std_m)
+        if v7 and teacher_history:
+            raise ValueError("V7 uses only student actions")
+        prototype = _Episode(sim_root, motion_dir, seed, split, cfgen_ratio, cfgen_goal_noise_std_m, v7=v7)
+        self.stage_sampler = prototype.stage_sampler if v7 else None
         model = _scene(prototype.root, (.15, .15, .15), headless=True)
         self._host = model
         self._box = model.geom("box_geom").id
@@ -355,7 +369,7 @@ class WarpCarryWorlds:
         self._geometry_cache = {}
         self._geometry_gpu_cache = {}
         self.envs = []
-        prototype.scenes = {path: load_demo(path) for path in prototype.paths}
+        prototype.scenes = {path: (load_demo(path, staged=True) if v7 else load_demo(path)) for path in prototype.paths}
         prototype._plan_cache = {}
         # Each fixed training file supplies at most one initial zero-noise plan.
         # Recovery references still use the actual live robot and box poses.
@@ -520,7 +534,7 @@ class WarpCarryWorlds:
                     e = self.envs[i]
                     root = e.d.qpos[:7].copy()
                     box = e.d.qpos[e.bp:e.bp + 7].copy()
-                    futs.append(pool.submit(_recovery_worker, str(e.root), root, box, e.half.copy(), e.goal.copy()))
+                    futs.append(pool.submit(_recovery_worker, str(e.root), root, box, e.half.copy(), e.goal.copy(), e.v7))
                 for i, fut in zip(rec_ids, futs):
                     self.envs[i]._precomputed_recovery = fut.result()
 
@@ -543,7 +557,7 @@ class WarpCarryWorlds:
             tabletop = float(e.d.mocap_pos[self._table2_id, 2] + self._table2_half_z)
             on_floor = abs(goal_bottom) < abs(goal_bottom - tabletop)
             st = e.state
-            init_boxes.append(st[71:74])
+            init_boxes.append(e._initial_box)
             goals.append(e.goal)
             on_floors.append(on_floor)
             clip_lens.append(len(e.clip))
@@ -573,8 +587,9 @@ class WarpCarryWorlds:
             self._goal_on_floor.index_copy_(0, idx_all, torch.as_tensor(on_floors, dtype=torch.bool, device=self.device))
             self._clip_len.index_copy_(0, idx_all, torch.as_tensor(clip_lens, dtype=torch.int32, device=self.device))
             self._env_index.index_copy_(0, idx_all, torch.as_tensor(indices, dtype=torch.int32, device=self.device))
-            self._lifted[idx_all] = False
-            self._carried_steps[idx_all] = 0
+            lifted = torch.as_tensor([self.envs[i]._lifted for i in ids], dtype=torch.bool, device=self.device)
+            self._lifted.index_copy_(0, idx_all, lifted)
+            self._carried_steps.index_copy_(0, idx_all, lifted.to(torch.int32) * 2)
             self._lost_steps[idx_all] = 0
             self._stable_steps[idx_all] = 0
             self._state_gpu.index_copy_(0, idx_all, torch.as_tensor(np.stack(states_host), dtype=torch.float32, device=self.device))
@@ -729,13 +744,19 @@ class WarpCarryWorlds:
         event_counts = Counter()
         drops = int(flags_np[:, 2].sum())
         rec_ids = []
-        for i in done_ids:
+        terminal_frames = (self._env_index[done_ids].cpu().tolist()
+                           if len(done_ids) and self.stage_sampler is not None else ())
+        for n_done, i in enumerate(done_ids):
             e = self.envs[i]
             e._done = True
             is_success = bool(flags_np[i, 1])
             is_drop = bool(flags_np[i, 2])
             is_timeout = bool(flags_np[i, 3])
             is_fallen = bool(flags_np[i, 4])
+            if self.stage_sampler is not None and e.source != "recovery":
+                self.stage_sampler.finish(e.source, e.start_index, terminal_frames[n_done], len(e.clip), is_success)
+                event_counts[f"stage/{e.source}/{e.start_stage}/done"] += 1
+                event_counts[f"stage/{e.source}/{e.start_stage}/success"] += int(is_success)
             e.pending_recovery = is_drop and not is_fallen and e.source != "recovery"
             if e.pending_recovery:
                 rec_ids.append(i)
@@ -804,6 +825,8 @@ class WarpCarryWorlds:
             e._lost_steps = int(lost_np[i])
             e._stable_steps = int(stable_np[i])
             e._done = bool(done_np[i])
+            if e._done and self.stage_sampler is not None:
+                self.stage_sampler.finish(e.source, e.start_index, e.index, len(e.clip), bool(success_np[i]))
             e.pending_recovery = bool(drop_np[i] and not fallen_np[i] and e.source != "recovery")
             ground, dest, origin = bool(supported[i, 0]), bool(supported[i, 1]), bool(supported[i, 2])
             infos.append(dict(

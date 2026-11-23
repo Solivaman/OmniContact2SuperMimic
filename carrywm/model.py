@@ -19,6 +19,7 @@ STATE_DIM = 84
 TARGET_DIM = 111
 OBS_DIM = 141
 GOAL_DIM = 113
+BOX_GOAL_DIM = GOAL_DIM + 9
 ACTION_DIM = 29
 
 # Each of these tracking terms is a weighted exponential bounded by its weight.
@@ -111,11 +112,12 @@ def _mlp(input_dim, hidden, output_dim):
 
 
 class Actor(nn.Module):
-    def __init__(self, first_width=2048, hidden=(1024, 512, 256), decoder_width=2048):
+    def __init__(self, first_width=2048, hidden=(1024, 512, 256), decoder_width=2048,
+                 *, goal_dim=GOAL_DIM):
         super().__init__()
-        self.goals = RunningNorm(GOAL_DIM)
+        self.goals = RunningNorm(goal_dim)
         self.observations = RunningNorm(OBS_DIM)
-        self.encoder = _mlp(11*GOAL_DIM, (first_width, *hidden), 32)
+        self.encoder = _mlp(11*goal_dim, (first_width, *hidden), 32)
         self.decoder = _mlp(32+10*OBS_DIM, (decoder_width, *hidden), ACTION_DIM)
         nn.init.normal_(self.decoder[-1].weight, std=0.005)
         nn.init.zeros_(self.decoder[-1].bias)
@@ -136,9 +138,9 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, context_dim, hidden=(512, 256), normalize=False):
+    def __init__(self, context_dim, hidden=(512, 256), normalize=False, *, goal_dim=GOAL_DIM):
         super().__init__()
-        input_dim = STATE_DIM + 11 * GOAL_DIM + context_dim
+        input_dim = STATE_DIM + 11 * goal_dim + context_dim
         self.inputs = RunningNorm(input_dim) if normalize else None
         self.value = _mlp(input_dim, hidden, 1)
 
@@ -156,9 +158,10 @@ class Critic(nn.Module):
 
 class WorldModel(nn.Module):
     """Shared dynamics trunk and independent 35-DoF robot / 6-DoF box velocity heads."""
-    def __init__(self, context_dim, width=2048):
+    def __init__(self, context_dim, width=2048, *, palm_geometry=None):
         super().__init__()
-        input_dim = STATE_DIM + ACTION_DIM + context_dim
+        self.palm_geometry = palm_geometry
+        input_dim = STATE_DIM + ACTION_DIM + context_dim + (6 if palm_geometry is not None else 0)
         self.inputs = RunningNorm(input_dim)
         self.trunk = nn.Sequential(nn.Linear(input_dim, width), nn.LayerNorm(width), nn.GELU(),
                                    nn.Linear(width, width), nn.LayerNorm(width), nn.GELU(),
@@ -170,11 +173,21 @@ class WorldModel(nn.Module):
             nn.init.normal_(head.weight, std=0.001)
             nn.init.zeros_(head.bias)
 
-    def update_stats(self, state, action, ctx):
-        self.inputs.update(torch.cat((state, action, ctx), -1))
+    def _features(self, state, action, ctx, fk=None):
+        features = (state, action, ctx)
+        if self.palm_geometry is not None:
+            # Preserve centimetre-scale contact geometry under mixed-precision MLP training.
+            with torch.autocast(device_type=state.device.type, enabled=False):
+                palms = self.palm_geometry.palms_in_box(state, ctx, fk)
+            features += (palms,)
+        return torch.cat(features, -1)
 
-    def forward(self, state, action, ctx):
-        initial = torch.cat((state, action, ctx), -1)
+    @torch.no_grad()
+    def update_stats(self, state, action, ctx):
+        self.inputs.update(self._features(state, action, ctx))
+
+    def forward(self, state, action, ctx, fk=None):
+        initial = self._features(state, action, ctx, fk)
         h = self.trunk(self.inputs(initial))
         dr, db = self.robot(h).float(), self.box(h).float()
         # Four physics substeps per tick. With a constant acceleration and
@@ -220,8 +233,10 @@ class CarryGeometry(nn.Module):
               "left_shoulder_roll_link", "left_elbow_link", "left_palm_link",
               "right_shoulder_roll_link", "right_elbow_link", "right_palm_link")
 
-    def __init__(self, sim2sim_root, *, tracking_weights=None, action_rate_weight=-0.1, action_l2_weight=0.0):
+    def __init__(self, sim2sim_root, *, tracking_weights=None, action_rate_weight=-0.1,
+                 action_l2_weight=0.0, box_goal=False):
         super().__init__()
+        self.box_goal = box_goal
         self.tracking_weights = dict(TRACKING_REWARD_WEIGHTS if tracking_weights is None else tracking_weights)
         self.action_rate_weight = float(action_rate_weight)
         self.action_l2_weight = float(action_l2_weight)
@@ -280,6 +295,11 @@ class CarryGeometry(nn.Module):
                                                    if "elbow" in n or "wrist" in n]))
         self.torso = names.index("torso_link")
         self.register_buffer("corners", torch.tensor(list(product((1., -1.), repeat=3))))
+        if box_goal:
+            # Same inward-facing collision-surface points as V7 IK and reset validation.
+            from .geometry_v7 import palm_surface_offsets
+            self.register_buffer("pad_offsets", torch.tensor(palm_surface_offsets(root), dtype=torch.float32),
+                                 persistent=False)
 
     def fk(self, root_pos, root_quat, joints):
         padded = F.pad(joints, (0,1))
@@ -297,6 +317,15 @@ class CarryGeometry(nn.Module):
 
     def forward_kinematics(self, state):
         return self.fk(state[..., :3], state[..., 3:7], state[..., 7:36])
+
+    def palms_in_box(self, state, ctx, fk=None):
+        """Left/right palm-pad centres in the box frame, in units of box half-size."""
+        fk = self.forward_kinematics(state) if fk is None else fk
+        palms = fk.index_select(-3, self.flow_ids[:2])
+        pads = palms[..., :3, 3] + _apply(palms[..., :3, :3], self.pad_offsets)
+        box_inv = quat_matrix(state[..., 74:78]).transpose(-1, -2).unsqueeze(-3)
+        local = _apply(box_inv, pads - state[..., None, 71:74])
+        return (local / ctx[..., None, :3].clamp_min(1e-6)).flatten(-2)
 
     def fk_from_target(self, target):
         return self.fk(target[..., 97:100], target[..., 100:104], target[..., 39:68])
@@ -328,9 +357,17 @@ class CarryGeometry(nn.Module):
         poses = target_window[..., :35].unflatten(-1,(5,7))
         p = _apply(inv, poses[..., :3] - torso[..., None,None,:3,3])
         r = inv @ quat_matrix(poses[..., 3:])
-        root_rel = quat_matrix(state[..., 3:7]).transpose(-1,-2).unsqueeze(-3) @ quat_matrix(target_window[..., 100:104])
-        return torch.cat((torch.cat((p, _rot6d(r)), -1).flatten(-2), target_window[..., 35:97],
-                          _rot6d(root_rel)), dim=-1)
+        root_rotation = quat_matrix(state[..., 3:7])
+        root_inv = root_rotation.transpose(-1, -2).unsqueeze(-3)
+        root_rel = root_inv @ quat_matrix(target_window[..., 100:104])
+        parts = (torch.cat((p, _rot6d(r)), -1).flatten(-2), target_window[..., 35:97],
+                 _rot6d(root_rel))
+        if self.box_goal:
+            heading_inv = _yaw_rotation(root_rotation).transpose(-1, -2).unsqueeze(-3)
+            box_pos = _apply(heading_inv, target_window[..., 104:107] - state[..., None, :3])
+            box_rot = root_inv @ quat_matrix(target_window[..., 107:111])
+            parts += (box_pos, _rot6d(box_rot))
+        return torch.cat(parts, dim=-1)
 
     def reward_terms(self, prev_state, state, prev_action, action, target, contacts, prev_fk=None, fk=None, target_fk=None):
         """Signed, timestep-scaled OmniContact terms; contacts are probabilities/real labels."""

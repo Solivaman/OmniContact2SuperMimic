@@ -10,6 +10,7 @@ import mujoco as mj
 import numpy as np
 import yaml
 
+from .stages_v7 import NoStageStart, STAGES, StageSampler
 from .data import OFFSETS, LAB2MJ, MJ2LAB, LINKS, generate_clip, load_demo, raw_window, split_paths
 
 
@@ -77,15 +78,32 @@ def _teacher(root):
     return ort.InferenceSession(str(path), opts, providers=["CPUExecutionProvider"])
 
 
+def _v7_recovery_plan(sim_root, root, box, half, goal):
+    from .geometry_v7 import generate_v7_clip, valid_start_mask
+
+    try:
+        frames, phase = generate_v7_clip(sim_root, root, box, half, goal)
+        grasp = np.flatnonzero((frames[:, 37:39] > .5).all(axis=1))
+        if len(grasp) and valid_start_mask(sim_root, frames, half, "cfgen", phase)[grasp[0]]:
+            return frames, phase
+    except (ValueError, FloatingPointError, np.linalg.LinAlgError):
+        pass
+    return None
+
+
 class CarryEnv:
     """One physical simulator. step() never resets or replaces the target clip."""
 
     def __init__(self, sim_root, motion_dir, seed=42, split="train", cfgen_ratio=.1,
-                 cfgen_goal_noise_std_m=DEFAULT_CFGEN_GOAL_NOISE_STD_M):
+                 cfgen_goal_noise_std_m=None, v7=False):
         if not 0 <= cfgen_ratio <= 1:
             raise ValueError("cfgen_ratio must be a probability")
+        if cfgen_goal_noise_std_m is None:
+            cfgen_goal_noise_std_m = 0. if v7 else DEFAULT_CFGEN_GOAL_NOISE_STD_M
         if not np.isfinite(cfgen_goal_noise_std_m) or cfgen_goal_noise_std_m < 0:
             raise ValueError("CF-Gen goal noise standard deviation must be finite and nonnegative")
+        self.v7 = v7
+        self.stage_sampler = StageSampler() if v7 and split == "train" else None
         self.cfgen_goal_noise_std_m = cfgen_goal_noise_std_m
         self.root = Path(sim_root).resolve()
         self.paths = split_paths(motion_dir, split)
@@ -124,9 +142,20 @@ class CarryEnv:
         mj.mj_forward(self.m, self.d)
 
     def _load_scene(self, path):
-        return load_demo(path)
+        return load_demo(path, staged=True) if self.v7 else load_demo(path)
 
     def _generate_reference(self, scene):
+        if self.v7:
+            from .geometry_v7 import generate_v7_clip
+            # Phase diagnostics reuse one scene/target for every requested start.
+            key = (self.name, self.goal.tobytes())
+            if self.split != "train" and getattr(self, "_last_plan_key", None) == key:
+                return self._last_plan
+            result = generate_v7_clip(self.root, scene.frames[0, 97:104], scene.frames[0, 104:111],
+                                      self.half, self.goal)
+            if self.split != "train":
+                self._last_plan_key, self._last_plan = key, result
+            return result
         return generate_clip(_generator(self.root), scene.frames[0,97:104],
                              scene.frames[0,104:111], self.half, self.goal)
 
@@ -134,6 +163,12 @@ class CarryEnv:
         """Verify the solved IK actually places both fingertips on the requested faces."""
         root = self.d.qpos[:7].copy()
         box = self.d.qpos[self.bp:self.bp+7].copy()
+        if self.v7:
+            plan = _v7_recovery_plan(self.root, root, box, self.half, self.goal)
+            if plan is None:
+                return False
+            self.clip, self.phase = plan
+            return True
         gen = _generator(self.root)
         try:
             frames, phase = generate_clip(gen, root, box, self.half, self.goal)
@@ -155,7 +190,71 @@ class CarryEnv:
         self.clip, self.phase = frames, phase
         return True
 
-    def reset(self, source=None):
+    def _load_main_episode(self, path, source, stage):
+        scene = self._load_scene(path)
+        self._bind_scene(scene.half)
+        self.source, self.name = source, path.stem
+        self.d.mocap_pos[self.table_ids] = scene.tables
+        self.goal = scene.frames[-1, 104:107].copy()
+        self.clip, self.phase = scene.frames, None
+        self._teacher_ankles = scene.teacher_ankles if source == "npz" else None
+        if source == "cfgen":
+            # Use scene geometry and the requested goal. The demonstration's
+            # future poses and contacts do not condition the generator.
+            if self.split == "train":
+                # Draw at zero scale too so the ablation preserves the scene RNG stream.
+                noise = self.rng.normal(0, self.cfgen_goal_noise_std_m, 2)
+                # Retain full footprint support on the target table.
+                reach = np.maximum(self.m.geom_size[self.tables_geom[1],:2] - np.linalg.norm(self.half[:2]), 0)
+                center = scene.tables[1,:2]
+                self.goal[:2] = np.clip(self.goal[:2] + noise, center-reach, center+reach)
+            self.clip, self.phase = self._generate_reference(scene)
+        self.index = 0
+        twists = scene.twists if source == "npz" else np.zeros_like(scene.twists)
+        self.start_stage = "approach"
+        if self.stage_sampler is not None:
+            catalogue = self.stage_sampler.catalogue(self.root, self.clip, self.half, source, self.phase,
+                                                    scene.tables, self.m.geom_size[self.tables_geom])
+            self.index = self.stage_sampler.choose(catalogue, source, self.rng, stage)
+            self.start_stage = STAGES[catalogue.labels[self.index]]
+            if source == "npz":
+                twists = scene.frame_twists[self.index]
+            elif self.index:
+                twists = catalogue.twists[self.index]
+        f = self.clip[self.index]
+        self.d.qpos[:7] = f[97:104]
+        self.d.qpos[7:36] = f[39:68]
+        self.d.qvel[:3] = twists[0]
+        self.d.qvel[3:6] = _matrix(f[100:104]).T @ twists[1]
+        self.d.qvel[6:35] = f[68:97]
+        self.d.qpos[self.bp:self.bp+7] = f[104:111]
+        self.d.qvel[self.bv:self.bv+3] = twists[2]
+        self.d.qvel[self.bv+3:self.bv+6] = _matrix(f[107:111]).T @ twists[3]
+        self._forward_reset()
+
+    def _starts_holding(self):
+        # A held suffix needs a carry/drop history, but a box resting on either
+        # support must earn its first lift in physical simulation.
+        f = self.clip[self.index]
+        if not self.index or not (f[37:39] > .5).all():
+            return False
+        center = f[104:107]
+        extent = np.abs(_matrix(f[107:111])) @ self.half
+        bottom = center[2] - extent[2]
+        if bottom <= .005:
+            return False
+        for table, geom in zip(self.table_ids, self.tables_geom):
+            position = self.d.mocap_pos[table]
+            size = self.m.geom_size[geom]
+            overlaps = (abs(center[:2] - position[:2]) < extent[:2] + size[:2]).all()
+            if overlaps and bottom <= position[2] + size[2] + .005:
+                return False
+        return True
+
+    def reset(self, source=None, *, stage=None):
+        if stage is not None and (self.stage_sampler is None or stage not in STAGES):
+            raise ValueError("A V7 stage reset requires an active sampler and a known stage")
+        self.start_stage = "approach"
         attempt = self.pending_recovery and source is None
         self.pending_recovery = False
         if attempt and self._try_recovery():
@@ -170,47 +269,34 @@ class CarryEnv:
             if source not in {"npz", "cfgen"}:
                 raise ValueError(f"Unknown reference source {source}")
             path = self.paths[self.rng.integers(len(self.paths))]
-            scene = self._load_scene(path)
-            self._bind_scene(scene.half)
-            self.source, self.name = source, path.stem
+            try:
+                self._load_main_episode(path, source, stage)
+            except NoStageStart:
+                # Keep reference source/ratio intact if a scene has no eligible frame.
+                others = [candidate for candidate in self.paths if candidate != path]
+                for i in self.rng.permutation(len(others)):
+                    try:
+                        self._load_main_episode(others[int(i)], source, stage)
+                        break
+                    except NoStageStart:
+                        continue
+                else:
+                    raise
             self.episode += 1
-            self.d.mocap_pos[self.table_ids] = scene.tables
-            self.goal = scene.frames[-1, 104:107].copy()
-            self.clip, self.phase = scene.frames, None
-            self._teacher_ankles = scene.teacher_ankles if source == "npz" else None
-            self.index = 0
-            twists = scene.twists.copy()
-            if source == "cfgen":
-                # Use scene geometry and the requested goal. The demonstration's
-                # future poses and contacts do not condition the generator.
-                if self.split == "train":
-                    # Draw at zero scale too so the ablation preserves the scene RNG stream.
-                    noise = self.rng.normal(0, self.cfgen_goal_noise_std_m, 2)
-                    # Retain full footprint support on the target table.
-                    reach = np.maximum(self.m.geom_size[self.tables_geom[1],:2] - np.linalg.norm(self.half[:2]), 0)
-                    center = scene.tables[1,:2]
-                    self.goal[:2] = np.clip(self.goal[:2] + noise, center-reach, center+reach)
-                self.clip, self.phase = self._generate_reference(scene)
-                twists[:] = 0
-            f = self.clip[self.index]
-            self.d.qpos[:7] = f[97:104]
-            self.d.qpos[7:36] = f[39:68]
-            self.d.qvel[:3] = twists[0]
-            self.d.qvel[3:6] = _matrix(f[100:104]).T @ twists[1]
-            self.d.qvel[6:35] = f[68:97]
-            self.d.qpos[self.bp:self.bp+7] = f[104:111]
-            self.d.qvel[self.bv:self.bv+3] = twists[2]
-            self.d.qvel[self.bv+3:self.bv+6] = _matrix(f[107:111]).T @ twists[3]
-            self._forward_reset()
+        self.start_index = self.index
         self.context = np.concatenate((self.half, self.m.body("box").mass,
                                        self.m.body("box").inertia, self.m.geom_friction[self.box_geom],
                                        self.d.mocap_pos[self.table_ids].ravel())).astype(np.float32)
-        self._done = self._lifted = False
-        self._lost_steps = self._stable_steps = self._carried_steps = 0
-        self._initial_box = self.state[71:74].copy()
+        self._done = False
+        self._lifted = self._starts_holding() if self.v7 and self.start_index else False
+        self.started_holding = self._lifted
+        self._lost_steps = self._stable_steps = 0
+        self._carried_steps = 2 if self._lifted else 0
+        self._initial_box = (self.clip[0, 104:107] if self.start_index else self.state[71:74]).copy()
         self._teacher_hist = np.zeros((5,141), np.float32)
         self.last_action = np.zeros(29, np.float32)
-        self._update_teacher_history()
+        if not getattr(self, "v7", False):
+            self._update_teacher_history()
 
     @property
     def state(self):
@@ -302,7 +388,8 @@ class CarryEnv:
     def _finish_step(self, action, contacts):
         self.last_action = action.copy()
         self.index = min(self.index+1,len(self.clip)-1)
-        self._update_teacher_history()
+        if not getattr(self, "v7", False):
+            self._update_teacher_history()
         state = self.state
         labels, ground, dest, origin = contacts
         hand = labels[2:4].any()
@@ -336,6 +423,8 @@ class CarryEnv:
         timeout = self.index == len(self.clip)-1 and not (fallen or drop or success)
         self._done = bool(drop or fallen or timeout or success)
         self.pending_recovery = drop and not fallen and self.source != "recovery"
+        if self._done and getattr(self, "stage_sampler", None) is not None and self.split == "train":
+            self.stage_sampler.finish(self.source, self.start_index, self.index, len(self.clip), success)
         info = dict(success=bool(success), drop=drop, timeout=timeout, fallen=fallen,
                     recovered=bool(success and self.source=="recovery"), goal_error=err,
                     box_error=float(np.linalg.norm(state[71:74]-self.clip[self.index,104:107])),

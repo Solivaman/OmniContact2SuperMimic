@@ -77,11 +77,13 @@ class VectorCollector:
             for i in ids:
                 src = f"teacher_{envs[i].source}" if self.world_is_teacher[i] else envs[i].source
                 self.episodes[f"{src}/started"] += 1
+                if getattr(self.env, "stage_sampler", None) is not None and envs[i].source != "recovery":
+                    self.episodes[f"stage/{src}/{envs[i].start_stage}/started"] += 1
             idx_t = torch.as_tensor(ids, dtype=torch.int64, device=device)
             self.state_gpu.index_copy_(0, idx_t, self.env._state_gpu.index_select(0, idx_t))
             self.context_gpu.index_copy_(0, idx_t, self.env._context_gpu.index_select(0, idx_t))
             self.previous_gpu[idx_t] = 0.0
-            self.frames_gpu[idx_t] = 0
+            self.frames_gpu.index_copy_(0, idx_t, self.env._env_index.index_select(0, idx_t))
             new_clip_ids = self.replay.register_clips(
                 [envs[i].clip for i in ids], static=False,
                 extra_active_ids=self.clip_ids_gpu if self.steps > 0 else None,
@@ -177,6 +179,8 @@ class VectorCollector:
                 env = envs[i]
                 self.state[i], self.context[i] = env.state, env.context
                 self.episodes[f"{env.source}/started"] += 1
+                if getattr(self.env, "stage_sampler", None) is not None and env.source != "recovery":
+                    self.episodes[f"stage/{env.source}/{env.start_stage}/started"] += 1
             self.previous[ids] = 0
 
         device = net.device
@@ -215,6 +219,10 @@ class VectorCollector:
             if done[i]:
                 source = envs[i].source
                 self.episodes[f"{source}/done"] += 1
+                if getattr(self.env, "stage_sampler", None) is not None and source != "recovery":
+                    stage = envs[i].start_stage
+                    self.episodes[f"stage/{source}/{stage}/done"] += 1
+                    self.episodes[f"stage/{source}/{stage}/success"] += int(info["success"])
                 for event in ("success", "drop", "timeout", "recovered", "fallen"):
                     self.episodes[f"{source}/{event}"] += int(info[event])
             drops += int(info["drop"])

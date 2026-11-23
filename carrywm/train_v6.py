@@ -45,6 +45,10 @@ def configure(parser):
 
 def args_from_cli(argv=None):
     args = train_v4.args_from_cli(argv, configure_parser=configure)
+    return configure_objective(args)
+
+
+def configure_objective(args):
     if not math.isfinite(args.drop_penalty) or args.drop_penalty < 0:
         raise ValueError("V6 requires a finite nonnegative drop penalty")
     if not math.isfinite(args.balance_reward_weight) or args.balance_reward_weight < 0:

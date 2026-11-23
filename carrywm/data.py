@@ -65,10 +65,11 @@ class SceneClip:
     # First root and box twists in world frame for the physics reset.
     twists: np.ndarray
     teacher_ankles: np.ndarray
+    frame_twists: np.ndarray | None = None
 
 
 @lru_cache(maxsize=32)
-def load_demo(path):
+def load_demo(path, *, staged=False):
     path = Path(path)
     with np.load(path, allow_pickle=False) as d:
         if not np.isclose(np.ravel(d["fps"])[0], 1/DT):
@@ -94,9 +95,16 @@ def load_demo(path):
         tables = np.stack([d[key].reshape(-1, 3)[0] for key in ("table1_pos_w", "table2_pos_w")])
         twists = np.stack((d["body_lin_vel_w"][0, 0], d["body_ang_vel_w"][0, 0],
                            d["object_lin_vel_w"][0], d["object_ang_vel_w"][0]))
+        frame_twists = None
+        if staged:
+            frame_twists = np.stack((d["body_lin_vel_w"][:, 0], d["body_ang_vel_w"][:, 0],
+                                     d["object_lin_vel_w"].reshape(-1, 3),
+                                     d["object_ang_vel_w"].reshape(-1, 3)), axis=1).astype(np.float32)
+            if len(frame_twists) != len(frames) or not np.isfinite(frame_twists).all():
+                raise ValueError(f"Invalid root or box velocity in {path}")
     if half.shape != (3,) or np.any(half <= 0) or not np.isfinite(half).all():
         raise ValueError(f"Invalid physical half-sizes {half} for {path}")
-    return SceneClip(frames, half, tables, twists, teacher_ankles)
+    return SceneClip(frames, half, tables, twists, teacher_ankles, frame_twists)
 
 
 def generate_clip(generator, root, box, half, goal):

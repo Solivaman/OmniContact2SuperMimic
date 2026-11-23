@@ -35,6 +35,9 @@ class UpdateClock:
         updates, self.credit = divmod(self.credit + self.increment, WM_SAMPLES)
         return updates
 
+    def ticks_until_update(self):
+        return (WM_SAMPLES - self.credit + self.increment - 1) // self.increment
+
 
 def _cpu_clone(obj):
     if torch.is_tensor(obj):
@@ -101,11 +104,12 @@ def configure(parser):
                         cfgen_goal_noise_std_m=0., collect_steps=5, eval_episodes=3)
 
 
-def args_from_cli(argv=None, *, configure_parser=configure):
+def args_from_cli(argv=None, *, configure_parser=configure, world_count=NUM_ENVS):
     args = base.args_from_cli(argv, configure=configure_parser)
-    if (args.num_envs != NUM_ENVS or args.collect_steps != 5 or args.wm_batch_size != train_v3.WM_BATCH
+    if (args.num_envs != world_count or args.collect_steps != UpdateClock(world_count).ticks_until_update()
+            or args.wm_batch_size != train_v3.WM_BATCH
             or args.batch_size != ACTOR_BATCH or args.auto_batch):
-        raise ValueError('The vector trainer uses 5 × 1024 real transitions, 10 × 1024 WM windows and 2048 actor rollouts')
+        raise ValueError(f'Use {world_count} physical worlds, 10 × 1024 WM windows and 2048 actor rollouts')
     if (args.cfgen_goal_noise_std_m != 0 or args.warmup_teacher or args.teacher_probability != 0
             or args.wm_pretrain != 0 or not 1 <= args.actor_microbatch <= ACTOR_BATCH
             or args.critic_chunk < 1):
@@ -130,9 +134,9 @@ def check_resume(ck, args, version):
     if ck['iteration'] >= args.iterations:
         raise ValueError('--iterations must exceed the saved iteration')
     keys = ('num_envs', 'capacity', 'cfgen_ratio', 'action_noise', 'goal_mode', 'seed')
-    if version in (5, 6):
+    if version in (5, 6, 7):
         keys += ('termination_height_m', 'termination_gravity_z', 'termination_softness', 'critic_value_max', 'drop_penalty')
-    if version == 6:
+    if version in (6, 7):
         keys += ('balance_reward_weight', 'action_rate_weight', 'action_l2_weight', 'obs_noise_scale',
                  'critic_norm', 'teacher_init_fraction', 'teacher_decay_iters', 'teacher_bc_weight')
     for key in keys:
@@ -166,6 +170,7 @@ def _run(args, version, learner_type):
     first, elapsed, old_steps, old_ticks = 1, 0., 0, 0
     peak_alloc = peak_reserved = 0
     episodes = {}
+    stage_state = None
     if args.resume:
         ck = torch.load(args.resume, map_location='cpu', weights_only=False)
         check_resume(ck, args, version)
@@ -182,6 +187,8 @@ def _run(args, version, learner_type):
         torch.set_rng_state(ck['torch_rng'])
         torch.cuda.set_rng_state(ck['cuda_rng'], device)
         episodes = ck['episodes']
+        if version == 7:
+            stage_state = ck['stage_sampler']
         del ck
     else:
         replay = VectorReplay(args.capacity, args.seed, args.num_envs, device=device)
@@ -197,13 +204,19 @@ def _run(args, version, learner_type):
         seed=args.seed + old_ticks, device=device, cfgen_ratio=args.cfgen_ratio,
         cfgen_cache_dir=args.cfgen_cache_dir, use_cuda_graph=args.cuda_graph,
         teacher_history=(teacher_init > 0.0 and first <= teacher_decay),
+        **({"v7": True} if version == 7 else {}),
     )
+    if stage_state is not None:
+        env.stage_sampler.load_state_dict(stage_state)
     collector = VectorCollector(env, net, replay, rng)
     collector.episodes.update(episodes)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     config.update(version=version, replay_ratio=REPLAY_RATIO, wm_horizon=base.WM_STEPS,
                   actor_horizon=base.HORIZON, physics='mujoco_warp', torch=str(torch.__version__),
                   hardware=torch.cuda.get_device_name(device))
+    if version == 7:
+        config.update(replay_steps_per_env=replay.rows, goal_dim=122, wm_palm_features=6,
+                      stage_uniform_fraction=0.5, teacher_free=True)
     (output / ('resume-config.json' if args.resume else 'config.json')).write_text(json.dumps(config, indent=2) + '\n')
 
     def record(data):
@@ -229,6 +242,7 @@ def _run(args, version, learner_type):
             torch_rng=torch.get_rng_state().clone(),
             cuda_rng=torch.cuda.get_rng_state(device).clone(),
             episodes=Counter(collector.episodes),
+            **({"stage_sampler": env.stage_sampler.state_dict()} if version == 7 else {}),
             config=dict(config),
             peak_bytes=(peak_alloc, peak_reserved),
         )
@@ -272,6 +286,7 @@ def _run(args, version, learner_type):
                 base.sync(device)
             tick = time.monotonic()
             before = collector.steps
+            expected_ticks = clock.ticks_until_update()
             totals = {}
             updates = 0
             while not updates:
@@ -287,10 +302,11 @@ def _run(args, version, learner_type):
                     warmup(base.WM_STEPS * args.num_envs, update_normalizers=False,
                            reason='no_continuous_window', episode_teacher_frac=ep_teacher)
                     before = collector.steps
+                    expected_ticks = clock.ticks_until_update()
                     totals.clear()
                     updates = 0
             new_steps = collector.steps - before
-            if updates != 1 or new_steps != args.collect_steps * args.num_envs:
+            if updates != 1 or new_steps != expected_ticks * args.num_envs:
                 raise RuntimeError('Inconsistent vector-step count for one learning round')
             stats = {
                 key: (value.item() if torch.is_tensor(value) else value) / (new_steps // args.num_envs)
@@ -321,6 +337,8 @@ def _run(args, version, learner_type):
                    'timing/wm_sec': after_wm - after_collect, 'timing/policy_sec': after_policy - after_wm,
                    'gpu/peak_allocated_bytes': peak_alloc, 'gpu/peak_reserved_bytes': peak_reserved}
             )
+            if version == 7:
+                stats.update({"sim/vector_ticks": expected_ticks, "replay/ratio_target": REPLAY_RATIO})
             if evaluate:
                 stats.update(base.validate(net, args))
             if should_save:

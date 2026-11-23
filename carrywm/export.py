@@ -26,7 +26,8 @@ class DeploymentActor(nn.Module):
 def export_actor(checkpoint, output):
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
     cfg = saved["config"]
-    actor = Actor(first_width=cfg["encoder_width"], decoder_width=cfg["decoder_width"])
+    goal_dim = saved["models"][1]["goals.mean"].numel()
+    actor = Actor(first_width=cfg["encoder_width"], decoder_width=cfg["decoder_width"], goal_dim=goal_dim)
     actor.load_state_dict(saved["models"][1])
     wrapper = DeploymentActor(actor.eval(), cfg.get("goal_mode", "full") == "flow").eval()
     del saved
@@ -34,7 +35,7 @@ def export_actor(checkpoint, output):
     output.parent.mkdir(parents=True, exist_ok=True)
     rng = torch.Generator().manual_seed(37)
     def example(batch):
-        return (torch.randn(batch, 11, 113, generator=rng), torch.randn(batch, 10, 141, generator=rng))
+        return (torch.randn(batch, 11, goal_dim, generator=rng), torch.randn(batch, 10, 141, generator=rng))
     with torch.inference_mode(), tempfile.TemporaryDirectory(dir=output.parent) as folder:
         module = torch.jit.freeze(torch.jit.trace(wrapper, example(1)))
         path = Path(folder) / "actor.pt"

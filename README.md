@@ -1,3 +1,25 @@
+# V7 · Unitree G1 无教师搬箱
+
+V7 用 OmniContact 的搬箱参考训练一个新的 CF-Track MLP。当前策略加探索噪声在 MuJoCo Warp 中采集动作和下一状态，世界模型用这些转移学习动力学。Actor 再从 replay 的真实状态出发，在冻结参数的世界模型中展开 32 步，通过奖励梯度学习。策略从随机初始化开始，预热和正式采集均由它控制。
+
+| 项目 | V7 默认训练配置 |
+|---|---|
+| 回合起点 | 在合格的参考时间段中，50% 均匀抽样、50% 按失败率抽样。NPZ 恢复对应帧的人、箱和速度；生成参考使用几何检查及参考速度。重置时用该状态的初始观测填充 10 帧历史，随后逐步替换为真实观测。正式留出评估从第 0 帧开始。 |
+| 参考来源 | 主回合 90% NPZ、10% 无目标噪声 CF-Gen。持箱时检查双掌相对侧面、摆放位置及腿箱间隙。 |
+| 世界模型 | 输入含左右掌接触表面点在当前箱体系中的位置，每个轴按箱子半尺寸缩放。每一步根据当前状态重新计算。机器人 35 维、箱子 6 维动力学输出与接触头沿用 V6。 |
+| Actor | 11 帧参考每帧增加未来箱位 3 维和朝向 6 维。输入为 `11 × 122 = 1342`，四层隐藏层、32 维潜变量、10 帧观测历史和 29 维动作沿用 V6。 |
+| 采样和更新 | 2048 个物理环境，每环境保留 1000 步。连续两轮采 3、2 个向量步，共得到 10240 条转移；每轮更新 WM 10 次，每次 1024 个 8 步窗口。两轮合计的 replay ratio 为 16。每轮 actor 用 2048 条 32 步想象轨迹更新一次，critic 训练 5 遍，每遍 4 个小批。 |
+
+在配置好 MuJoCo Warp 的 CUDA 环境中，将 `SIM` 指向官方 `OmniContact_sim2sim`，将 `MOTIONS` 指向 `case1_carry` 动作目录，运行以下命令。
+
+```bash
+python -m carrywm.monitor --output-dir outputs/v7 -- \
+  python -m carrywm.train_v7 --sim-root "$SIM" --motion-dir "$MOTIONS" \
+  --output-dir outputs/v7 --device cuda:0 --precision bf16 --iterations 2000 --seed 42
+```
+
+`metrics.jsonl` 记录实际训练步数、WM 误差、从头评估的结果与时间；`gpu-*.csv` 记录整卡 GPU busy 和设备、进程显存。使用 `python -m carrywm.eval_stages_v7 --checkpoint outputs/v7/latest.pt --sim-root "$SIM" --motion-dir "$MOTIONS" --scenes 6` 可在留出场景单独评估各阶段起点；这些结果与从头完成搬运的成功率分别统计。[训练入口](carrywm/train_v7.py)
+
 # OmniContact 原版与 V5 的完整改动对照：Unitree G1 搬箱
 
 原版 OmniContact 将搬箱分成两层。CF-Gen 根据机器人、箱子和目标桌的位置规划接触流，CF-Track 每 20 ms 根据参考和观测给 G1 的 29 个关节发指令。**V5 沿用官方 CF-Gen、搬箱示范、G1 模型和关节控制接口，重新训练低层 CF-Track。** 原版 actor 通过 Isaac Lab 中实际执行过的动作学习；V5 先让可微世界模型（WM）从 MuJoCo 物理交互学会预测，再让 actor 在 WM 里连续尝试 32 步，通过未来搬箱回报的梯度更新动作策略。

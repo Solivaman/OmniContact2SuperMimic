@@ -4,7 +4,7 @@ import torch
 from .model import quat_matrix, _rotation_error
 
 
-def _phase_masks(states, contacts, targets, events):
+def _phase_masks(states, contacts, targets, events, *, grasp_phases=False):
     """Endpoint phase, with precedence for landing, then slip, held, and empty."""
     device = states.device
     count = contacts.shape[0]
@@ -25,8 +25,15 @@ def _phase_masks(states, contacts, targets, events):
     # slip from the intended release onto a table.
     slip = lifted & expected & ~hand & ~landing
     held = hand & ~landing
-    return {"all":torch.ones_like(hand), "held":held, "slip":slip,
-            "landing":landing, "empty":~(held | slip | landing)}
+    masks = {"all":torch.ones_like(hand), "held":held, "slip":slip,
+             "landing":landing, "empty":~(held | slip | landing)}
+    if grasp_phases and events is not None:
+        both = contacts[:, 2:4].gt(.5).all(-1)
+        def onset(active):
+            return active & ~torch.cat((torch.zeros_like(active[:1]), active[:-1]))
+        masks.update(bilateral_onset=onset(both), lift_onset=onset(lifted),
+                     carrying=lifted & ~support & hand)
+    return masks
 
 
 @torch.no_grad()
@@ -50,7 +57,8 @@ def validate_dynamics(wm, states, actions, contexts, contacts, target_frames,
         contexts = contexts.expand(count, -1)
     if len(contexts) != count:
         raise ValueError("contexts must be per-episode or per-transition")
-    masks = _phase_masks(states, contacts, target_frames, events)
+    palm_dynamics = getattr(wm, "palm_geometry", None) is not None
+    masks = _phase_masks(states, contacts, target_frames, events, grasp_phases=palm_dynamics)
     device = states.device
     prefix = torch.cat((torch.zeros(1,device=device,dtype=torch.long),
                         terminals.reshape(count).long().cumsum(0)))
@@ -61,7 +69,10 @@ def validate_dynamics(wm, states, actions, contexts, contacts, target_frames,
         # Retain rare landing/release observations in addition to regularly
         # spaced starts, so a one-frame collision can contribute a measurement.
         base = torch.arange(0, count-horizon+1, stride, device=device)
-        landing_end = masks["landing"].nonzero().flatten() - horizon + 1
+        rare = masks["landing"]
+        if "lift_onset" in masks:
+            rare = rare | masks["lift_onset"] | masks["bilateral_onset"]
+        landing_end = rare.nonzero().flatten() - horizon + 1
         terminal_end = terminals.reshape(-1).nonzero().flatten() - horizon + 1
         starts = torch.unique(torch.cat((base,landing_end,terminal_end)))
         starts = starts[starts>=0]
@@ -87,6 +98,15 @@ def validate_dynamics(wm, states, actions, contexts, contacts, target_frames,
             "contact_accuracy": ((logits[:,:4]>0)==(contacts[end-1,:4]>.5)).float().mean(-1),
             "support_accuracy": ((logits[:,4:]>0)==(contacts[end-1,4:]>.5)).float().mean(-1),
         }
+        if palm_dynamics:
+            # World vertical in box coordinates makes this angle independent of yaw.
+            up_a = quat_matrix(pred[:,74:78])[:,2,:]
+            up_b = quat_matrix(truth[:,74:78])[:,2,:]
+            metrics["box_tilt_rad"] = torch.atan2(torch.linalg.cross(up_a, up_b).norm(dim=-1),
+                                                   (up_a * up_b).sum(-1))
+            metrics["box_height_m"] = (pred[:,73] - truth[:,73]).abs()
+            metrics["bilateral_accuracy"] = ((logits[:,2:4]>0).all(-1) ==
+                                              (contacts[end-1,2:4]>.5).all(-1)).float()
         for phase, rows in masks.items():
             selected = rows[end-1]
             number = int(selected.sum().item())

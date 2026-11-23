@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 from .data import split_paths
-from .model import Actor, Critic, WorldModel, CarryGeometry, world_loss
+from .model import Actor, Critic, WorldModel, CarryGeometry, GOAL_DIM, BOX_GOAL_DIM, world_loss
 from .replay import Replay, array
 from .sim import CarryEnv, DEFAULT_CFGEN_GOAL_NOISE_STD_M
 
@@ -132,6 +132,8 @@ def lambda_returns(rewards, next_values, continues, gamma=GAMMA, lam=LAMBDA):
 
 
 class Learner:
+    box_features = False
+
     def __init__(self, args, context_dim=16):
         self.args = args
         self.device = torch.device(args.device)
@@ -141,10 +143,15 @@ class Learner:
             tracking_weights=getattr(args, "tracking_weights", None),
             action_rate_weight=getattr(args, "action_rate_weight", -0.1),
             action_l2_weight=getattr(args, "action_l2_weight", 0.0),
+            box_goal=self.box_features,
         ).to(self.device)
-        self.actor = Actor(first_width=args.encoder_width, decoder_width=args.decoder_width).to(self.device)
-        self.wm = WorldModel(context_dim, width=args.wm_width).to(self.device)
-        self.critic = Critic(context_dim, normalize=getattr(args, "critic_norm", False)).to(self.device)
+        goal_dim = BOX_GOAL_DIM if self.box_features else GOAL_DIM
+        self.actor = Actor(first_width=args.encoder_width, decoder_width=args.decoder_width,
+                           goal_dim=goal_dim).to(self.device)
+        self.wm = WorldModel(context_dim, width=args.wm_width,
+                             palm_geometry=self.geo if self.box_features else None).to(self.device)
+        self.critic = Critic(context_dim, normalize=getattr(args, "critic_norm", False),
+                             goal_dim=goal_dim).to(self.device)
         self.models = [self.wm, self.actor, self.critic]
         adam_kw = {"fused": True} if self.device.type == "cuda" else {}
         self.optimizers = [torch.optim.Adam(m.parameters(), lr=args.lr, **adam_kw) for m in self.models]
@@ -180,10 +187,13 @@ class Learner:
         return goal
 
     def _collect_act_impl(self, state, prev, ctx, raw_win, hist, fresh_mask):
-        obs = self.geo.observation(state, prev, ctx)
+        # V7 needs FK for both the current observation and the box-conditioned reference.
+        fk = self.geo.forward_kinematics(state) if self.box_features else None
+        obs = (self.geo.observation(state, prev, ctx, fk=fk) if self.box_features
+               else self.geo.observation(state, prev, ctx))
         shifted = torch.cat((hist[:, 1:], obs[:, None]), dim=1)
         new_hist = torch.where(fresh_mask[:, None, None], obs[:, None].expand(-1, 10, -1), shifted)
-        goal = self.reference(state, raw_win)
+        goal = self.reference(state, raw_win, fk=fk)
         with self.autocast():
             actions = self.actor(goal, new_hist).float()
         return obs, new_hist, actions
@@ -230,7 +240,10 @@ class Learner:
                       target_fk_j, slip_frames, step_num_next, remaining, checkpoint_encoder=False):
         with self.autocast():
             action = self.actor(goal, hist, checkpoint_encoder=checkpoint_encoder).float().clamp(-10, 10)
-            after, logits = self.wm(state, action, ctx)
+            if self.box_features:
+                after, logits = self.wm(state, action, ctx, fk=fk)
+            else:
+                after, logits = self.wm(state, action, ctx)
         after = after.float()
         contacts = logits.float().sigmoid()
         next_fk = self.geo.forward_kinematics(after)
@@ -432,8 +445,10 @@ def _init_eval_worker():
 class _CpuEvalNet:
     def __init__(self, sim_root, goal_mode, drop_penalty, encoder_width, decoder_width, actor_state):
         self.device = torch.device("cpu")
-        self.geo = CarryGeometry(sim_root)
-        self.actor = Actor(first_width=encoder_width, decoder_width=decoder_width)
+        goal_dim = actor_state["goals.mean"].numel()
+        self.box_features = goal_dim == BOX_GOAL_DIM
+        self.geo = CarryGeometry(sim_root, box_goal=self.box_features)
+        self.actor = Actor(first_width=encoder_width, decoder_width=decoder_width, goal_dim=goal_dim)
         self.actor.load_state_dict(actor_state)
         self.args = type("Args", (), {"goal_mode": goal_mode, "drop_penalty": drop_penalty})()
 
@@ -450,10 +465,10 @@ class _CpuEvalNet:
 def _eval_episode_worker(spec):
     (sim_root, motion_dir, seed, cfgen_ratio, cfgen_goal_noise_std_m,
      goal_mode, drop_penalty, encoder_width, decoder_width, actor_state, jobs) = spec
-    env = CarryEnv(sim_root, motion_dir, seed=seed, split="val",
-                   cfgen_ratio=cfgen_ratio, cfgen_goal_noise_std_m=cfgen_goal_noise_std_m)
-    all_paths = list(env.paths)
     net = _CpuEvalNet(sim_root, goal_mode, drop_penalty, encoder_width, decoder_width, actor_state)
+    env = CarryEnv(sim_root, motion_dir, seed=seed, split="val", cfgen_ratio=cfgen_ratio,
+                   cfgen_goal_noise_std_m=cfgen_goal_noise_std_m, v7=net.box_features)
+    all_paths = list(env.paths)
     replay = Replay(65536, seed)
     collector = Collector(env, net, replay, np.random.default_rng(seed))
     for source, path_idx in jobs:
@@ -519,7 +534,8 @@ def validate(net, args):
                 segments.extend(segs)
     else:
         env = CarryEnv(args.sim_root, args.motion_dir, seed=args.seed+811, split="val",
-                       cfgen_ratio=args.cfgen_ratio, cfgen_goal_noise_std_m=cfgen_std)
+                       cfgen_ratio=args.cfgen_ratio, cfgen_goal_noise_std_m=cfgen_std,
+                       v7=getattr(net, "box_features", False))
         replay = Replay(max(65536, args.capacity), args.seed+811)
         collector = Collector(env, net, replay, np.random.default_rng(args.seed+811))
         for source in ("npz", "cfgen"):
