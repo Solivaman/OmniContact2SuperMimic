@@ -44,3 +44,18 @@ V7 训练器默认启用混合参考库、批量重置、批量参考 FK 与编�
 python -m scripts.bench_v7_recovery --sim-root "$CARRY_SIM_ROOT" --inputs captured-drops.json --output recovery.json --workers 8 --group-size 8
 python -m scripts.bench_v7_ik_queries --sim-root "$CARRY_SIM_ROOT" --motion-dir "$CARRY_MOTION_DIR" --output ik-queries.json
 ```
+
+## 正式续训结果
+
+服务器从同一份 V7 第 200 轮检查点恢复了网络、优化器和回放。第 250 轮记录到 4215902 帧参考，主机缓存容量已增至 7096148 帧，GPU 参考缓存维持在 311.48 MiB，并完成了原任务未达到的第 250 轮评估。
+
+| 第 210–245 轮同窗口 | 原 V7 | V7 GPU acceleration |
+|---|---:|---:|
+| 实际新增物理转移 | 180224 | 180224 |
+| 端到端墙钟时间 | 405.8 秒 | 153.9 秒 |
+| 端到端物理转移/秒 | 444 | 1171 |
+| 采集阶段物理转移/秒（8 个日志采样轮次） | 554 | 1797 |
+| 设备 GPU 忙碌率（每 2 秒采样的均值） | 6.3% | 17.4% |
+| 窗口内训练进程显存峰值 | 18272 MiB | 13288 MiB |
+
+此窗口避开恢复预热、首次编译和定期评估。恢复后物理回合重新初始化，因此对比衡量这两次实际运行的综合速度。该窗口内训练吞吐提高 2.64 倍。第 250 轮留出评估中，NPZ 和 CF-Gen 的完整搬运成功率均为 0/6；上述结果证明了工程吞吐和稳定性的改善，控制效果仍需继续评估。
