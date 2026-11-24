@@ -21,10 +21,15 @@ SIZE = re.compile(r"^carry_box_(\d+)-(\d+)-(\d+)_(.+)$")
 
 def split_paths(directory, split):
     """All geometries and numbered cuts of a source motion share a partition."""
-    if split not in {"train", "val", "test"}:
+    if split not in {"train", "val", "test", "all"}:
         raise ValueError(f"Unknown partition {split!r}")
+    files = tuple(sorted(Path(directory).glob("*.npz")))
+    if split == "all":
+        if not files:
+            raise ValueError(f"No carry reference files found in {directory}")
+        return files
     groups = {}
-    for file in sorted(Path(directory).glob("*.npz")):
+    for file in files:
         match = SIZE.match(file.stem)
         source = match.group(4).rsplit("_", 1)[0] if match else file.stem
         groups.setdefault(source, []).append(file)

@@ -129,13 +129,18 @@ class StageSampler:
             raise ValueError("Invalid V7 stage curriculum checkpoint")
         self.visits[:], self.failures[:] = visits, failures
 
-    def catalogue(self, root, frames, half, source, phase, table_positions, table_half_sizes):
+    def catalogue(self, root, frames, half, source, phase, table_positions, table_half_sizes, *, precomputed_valid=None):
         # Fixed training clips share one catalogue across every physical world.
         # Let temporary plans from independent diagnostic resets be collected.
         key = id(frames)
         if key not in self._clips:
-            from .geometry_v7 import valid_start_mask
-            valid = np.asarray(valid_start_mask(root, frames, half, source, phase), dtype=bool).copy()
+            if precomputed_valid is not None:
+                valid = np.asarray(precomputed_valid, dtype=bool).copy()
+                if valid.shape != (len(frames),):
+                    raise ValueError(f"precomputed_valid shape {valid.shape} does not match clip length {len(frames)}")
+            else:
+                from .geometry_v7 import valid_start_mask
+                valid = np.asarray(valid_start_mask(root, frames, half, source, phase), dtype=bool).copy()
             support_valid, starts_holding, last_box_extent_z = _clip_box_metadata(
                 frames, half, table_positions, table_half_sizes
             )

@@ -73,6 +73,12 @@ def args_from_cli(argv=None, *, configure=None):
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-episodes", type=int, default=1, help="per primary reference source")
+    p.add_argument("--motion-split", choices=("train", "all"), default="train",
+                   help="Partition of --motion-dir used for MoCap training clips")
+    p.add_argument("--cfgen-train-pack", type=Path, default=None,
+                   help="Optional offline official V7 CF-Gen training pack (.npz)")
+    p.add_argument("--val-pack", type=Path, default=None,
+                   help="Optional fixed offline official V7 CF-Gen validation pack (.npz)")
     p.add_argument("--save-every", type=int, default=100)
     p.add_argument("--log-every", type=int, default=10)
     if configure is not None:
@@ -523,30 +529,29 @@ class _CpuEvalNet:
         return goal
 
 
-def _eval_episode_worker(spec):
-    (sim_root, motion_dir, seed, cfgen_ratio, cfgen_goal_noise_std_m,
-     goal_mode, drop_penalty, encoder_width, decoder_width, actor_state, jobs) = spec
-    net = _CpuEvalNet(sim_root, goal_mode, drop_penalty, encoder_width, decoder_width, actor_state)
-    env = CarryEnv(sim_root, motion_dir, seed=seed, split="val", cfgen_ratio=cfgen_ratio,
-                   cfgen_goal_noise_std_m=cfgen_goal_noise_std_m, v7=net.box_features)
-    all_paths = list(env.paths)
-    replay = Replay(65536, seed)
-    collector = Collector(env, net, replay, np.random.default_rng(seed))
-    for source, path_idx in jobs:
-        env.paths = [all_paths[path_idx]]
-        collector.reset(source)
-        env.paths = all_paths
-        for _ in range(2):
-            seg = collector.seg
-            while collector.seg is not None:
-                collector.collect(64, stop_at_done=True)
-            if not seg.events[-1]["drop"] or seg.source == "recovery":
-                break
-            if not getattr(env, "pending_recovery", False):
-                break
-            collector.reset()
-            if collector.seg.source != "recovery":
-                break
+def _run_eval_episode(env, collector, source):
+    """Run one primary evaluation episode plus at most one online recovery attempt."""
+    collector.reset(source)
+    main_seg = rec_seg = None
+    for attempt_idx in range(2):
+        seg = collector.seg
+        if attempt_idx == 0:
+            main_seg = seg
+        else:
+            rec_seg = seg
+        while collector.seg is not None:
+            collector.collect(64, stop_at_done=True)
+        if not seg.events[-1]["drop"] or seg.source == "recovery":
+            break
+        if not getattr(env, "pending_recovery", False):
+            break
+        collector.reset()
+        if collector.seg.source != "recovery":
+            break
+    return main_seg, rec_seg
+
+
+def _pack_segments(replay):
     segments = []
     for seg in replay.segments:
         if not len(seg):
@@ -563,13 +568,163 @@ def _eval_episode_worker(spec):
             seg.events,
             len(seg.clip),
         ))
-    return dict(collector.episodes), segments
+    return segments
+
+
+def _eval_episode_worker(spec):
+    (sim_root, motion_dir, seed, cfgen_ratio, cfgen_goal_noise_std_m,
+     goal_mode, drop_penalty, encoder_width, decoder_width, actor_state, jobs) = spec
+    net = _CpuEvalNet(sim_root, goal_mode, drop_penalty, encoder_width, decoder_width, actor_state)
+    env = CarryEnv(sim_root, motion_dir, seed=seed, split="val", cfgen_ratio=cfgen_ratio,
+                   cfgen_goal_noise_std_m=cfgen_goal_noise_std_m, v7=net.box_features)
+    all_paths = list(env.paths)
+    replay = Replay(65536, seed)
+    collector = Collector(env, net, replay, np.random.default_rng(seed))
+    for source, path_idx in jobs:
+        env.paths = [all_paths[path_idx]]
+        _run_eval_episode(env, collector, source)
+        env.paths = all_paths
+    return dict(collector.episodes), _pack_segments(replay)
+
+
+def _record_val_pack_episode(clip, main_seg, rec_seg):
+    main_last = main_seg.events[-1]
+    main_succ = bool(main_last["success"])
+    rec_succ = bool(rec_seg is not None and rec_seg.events and rec_seg.events[-1]["success"])
+    return {
+        "bench_type": clip.bench_type,
+        "success": main_succ,
+        "e2e_success": bool(main_succ or rec_succ),
+        "drop": bool(main_last["drop"]),
+        "fallen": bool(main_last["fallen"]),
+        "timeout": bool(main_last["timeout"]),
+        "lifted": any(x.get("lifted", False) for x in main_seg.events),
+        "steps": len(main_seg.events),
+        "survival_pct": 100.0 * len(main_seg.events) / max(len(main_seg.clip), 1),
+    }
+
+
+def _eval_val_pack_worker(spec):
+    from .official_pool import load_official_pack
+
+    (sim_root, val_pack_path, seed, goal_mode, drop_penalty,
+     encoder_width, decoder_width, actor_state, job_indices) = spec
+    val_clips, _ = load_official_pack(val_pack_path)
+    subset = tuple(val_clips[i] for i in job_indices)
+    del val_clips
+    net = _CpuEvalNet(sim_root, goal_mode, drop_penalty, encoder_width, decoder_width, actor_state)
+    env = CarryEnv(sim_root, None, seed=seed, split="val", cfgen_ratio=1.0,
+                   cfgen_goal_noise_std_m=0.0, v7=net.box_features, cfgen_pool=subset)
+    replay = Replay(max(8192, len(subset) * 2000), seed)
+    collector = Collector(env, net, replay, np.random.default_rng(seed))
+    ep_records = []
+    for clip in subset:
+        env.cfgen_pool = (clip,)
+        main_seg, rec_seg = _run_eval_episode(env, collector, "cfgen")
+        ep_records.append(_record_val_pack_episode(clip, main_seg, rec_seg))
+    env.cfgen_pool = subset
+    return dict(collector.episodes), _pack_segments(replay), ep_records
+
+
+def _summarize_eval_results(episodes, segments, net, *, ep_records=None, sources=("npz", "cfgen", "recovery")):
+    results = {f"eval/{k}": v for k, v in episodes.items()}
+    ep_groups = {}
+    for item in segments:
+        ep_groups.setdefault(item[0], []).append((item[7], item[8]))
+    for source in sources:
+        n = episodes[f"{source}/done"]
+        if n:
+            for key in ("success", "drop", "fallen"):
+                results[f"eval/{source}/{key}_rate"] = episodes[f"{source}/{key}"] / n
+        if source in ep_groups:
+            grp = ep_groups[source]
+            results[f"eval/{source}/mean_steps"] = float(np.mean([len(ev) for ev, _ in grp]))
+            results[f"eval/{source}/mean_survival_pct"] = float(np.mean([
+                100.0 * len(ev) / max(clen, 1) for ev, clen in grp
+            ]))
+            results[f"eval/{source}/lift_rate"] = float(np.mean([
+                any(x.get("lifted", False) for x in ev) for ev, _ in grp
+            ]))
+    if ep_records:
+        results["eval/cfgen/end_to_end_success_rate"] = float(np.mean([r["e2e_success"] for r in ep_records]))
+        for bench_key, metric_prefix in (("bench_a", "cfgen_a"), ("bench_b", "cfgen_b")):
+            sub = [r for r in ep_records if r["bench_type"] == bench_key]
+            if not sub:
+                continue
+            results[f"eval/{metric_prefix}/done"] = len(sub)
+            results[f"eval/{metric_prefix}/success_rate"] = float(np.mean([r["success"] for r in sub]))
+            results[f"eval/{metric_prefix}/end_to_end_success_rate"] = float(np.mean([r["e2e_success"] for r in sub]))
+            results[f"eval/{metric_prefix}/lift_rate"] = float(np.mean([r["lifted"] for r in sub]))
+            results[f"eval/{metric_prefix}/drop_rate"] = float(np.mean([r["drop"] for r in sub]))
+            results[f"eval/{metric_prefix}/fallen_rate"] = float(np.mean([r["fallen"] for r in sub]))
+            results[f"eval/{metric_prefix}/mean_steps"] = float(np.mean([r["steps"] for r in sub]))
+            results[f"eval/{metric_prefix}/mean_survival_pct"] = float(np.mean([r["survival_pct"] for r in sub]))
+    from .validation import validate_dynamics, aggregate_dynamics
+    evaluated = []
+    by_source = {}
+    for source, states, actions, context, contacts, targets, dones, events, _ in segments:
+        args_wm = (states, actions, context, contacts, targets, dones)
+        held = [tensor(np.asarray(x), net.device) for x in args_wm]
+        held[-1] = held[-1].bool()
+        wm_metrics = validate_dynamics(net.wm, *held, events=events)
+        evaluated.append(wm_metrics)
+        by_source.setdefault(source, []).append(wm_metrics)
+    results.update({f"eval/dynamics/{k}": v for k, v in aggregate_dynamics(evaluated).items()})
+    for source, ep_metrics in by_source.items():
+        results.update({f"eval/{source}/dynamics/{k}": v for k, v in aggregate_dynamics(ep_metrics).items()})
+    return results
 
 
 @torch.no_grad()
 def validate(net, args):
-    cfgen_std = getattr(args, "cfgen_goal_noise_std_m", DEFAULT_CFGEN_GOAL_NOISE_STD_M)
     eval_workers = getattr(args, "eval_workers", 1)
+    val_pack = getattr(args, "val_pack", None)
+    if val_pack is not None:
+        from .official_pool import load_official_pack
+
+        val_clips, _ = load_official_pack(val_pack)
+        n_eval = min(args.eval_episodes, len(val_clips))
+        job_indices = list(range(n_eval))
+        if eval_workers > 1 and n_eval > 1 and hasattr(net.actor, "state_dict"):
+            n_workers = min(eval_workers, n_eval)
+            buckets = [job_indices[i::n_workers] for i in range(n_workers)]
+            actor_state = {k: v.detach().cpu() for k, v in net.actor.state_dict().items()}
+            specs = [
+                (args.sim_root, val_pack, args.seed + 811 + idx, args.goal_mode, args.drop_penalty,
+                 args.encoder_width, args.decoder_width, actor_state, bucket)
+                for idx, bucket in enumerate(buckets) if bucket
+            ]
+            episodes = Counter()
+            segments = []
+            ep_records = []
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=len(specs), mp_context=ctx,
+                                     initializer=_init_eval_worker) as pool:
+                for ep_counts, segs, recs in pool.map(_eval_val_pack_worker, specs):
+                    episodes.update(ep_counts)
+                    segments.extend(segs)
+                    ep_records.extend(recs)
+        else:
+            env = CarryEnv(args.sim_root, None, seed=args.seed + 811, split="val",
+                           cfgen_ratio=1.0, cfgen_goal_noise_std_m=0.0,
+                           v7=getattr(net, "box_features", False), cfgen_pool=val_clips)
+            all_pool = env.cfgen_pool
+            replay = Replay(max(65536, n_eval * 2000), args.seed + 811)
+            collector = Collector(env, net, replay, np.random.default_rng(args.seed + 811))
+            ep_records = []
+            for clip_idx in job_indices:
+                clip = all_pool[clip_idx]
+                env.cfgen_pool = (clip,)
+                main_seg, rec_seg = _run_eval_episode(env, collector, "cfgen")
+                env.cfgen_pool = all_pool
+                ep_records.append(_record_val_pack_episode(clip, main_seg, rec_seg))
+            episodes = collector.episodes
+            segments = _pack_segments(replay)
+        return _summarize_eval_results(
+            episodes, segments, net, ep_records=ep_records, sources=("cfgen", "recovery")
+        )
+
+    cfgen_std = getattr(args, "cfgen_goal_noise_std_m", DEFAULT_CFGEN_GOAL_NOISE_STD_M)
     total_episodes = 2 * args.eval_episodes
     if eval_workers > 1 and total_episodes > 1 and hasattr(net.actor, "state_dict"):
         all_paths = split_paths(args.motion_dir, "val")
@@ -601,61 +756,11 @@ def validate(net, args):
         collector = Collector(env, net, replay, np.random.default_rng(args.seed+811))
         for source in ("npz", "cfgen"):
             for _ in range(args.eval_episodes):
-                collector.reset(source)
-                for _ in range(2):  # One recovery attempt, separately counted and scored.
-                    seg = collector.seg
-                    while collector.seg is not None:
-                        collector.collect(64, stop_at_done=True)
-                    if not seg.events[-1]["drop"] or seg.source == "recovery":
-                        break
-                    if not getattr(env, "pending_recovery", False):
-                        break
-                    collector.reset()
-                    if collector.seg.source != "recovery":
-                        break
+                _run_eval_episode(env, collector, source)
         episodes = collector.episodes
-        segments = []
-        for seg in replay.segments:
-            if not len(seg):
-                continue
-            indices = [*seg.frames, min(seg.frames[-1] + 1, len(seg.clip) - 1)]
-            segments.append((
-                seg.source, seg.states, seg.actions, seg.context, seg.contacts,
-                seg.clip[indices], [x["done"] for x in seg.events], seg.events, len(seg.clip),
-            ))
+        segments = _pack_segments(replay)
 
-    results = {f"eval/{k}": v for k, v in episodes.items()}
-    ep_groups = {}
-    for item in segments:
-        ep_groups.setdefault(item[0], []).append((item[7], item[8]))
-    for source in ("npz", "cfgen", "recovery"):
-        n = episodes[f"{source}/done"]
-        if n:
-            for key in ("success", "drop", "fallen"):
-                results[f"eval/{source}/{key}_rate"] = episodes[f"{source}/{key}"] / n
-        if source in ep_groups:
-            grp = ep_groups[source]
-            results[f"eval/{source}/mean_steps"] = float(np.mean([len(ev) for ev, _ in grp]))
-            results[f"eval/{source}/mean_survival_pct"] = float(np.mean([
-                100.0 * len(ev) / max(clen, 1) for ev, clen in grp
-            ]))
-            results[f"eval/{source}/lift_rate"] = float(np.mean([
-                any(x.get("lifted", False) for x in ev) for ev, _ in grp
-            ]))
-    from .validation import validate_dynamics, aggregate_dynamics
-    evaluated = []
-    by_source = {}
-    for source, states, actions, context, contacts, targets, dones, events, _ in segments:
-        args_wm = (states, actions, context, contacts, targets, dones)
-        held = [tensor(np.asarray(x), net.device) for x in args_wm]
-        held[-1] = held[-1].bool()
-        wm_metrics = validate_dynamics(net.wm, *held, events=events)
-        evaluated.append(wm_metrics)
-        by_source.setdefault(source, []).append(wm_metrics)
-    results.update({f"eval/dynamics/{k}": v for k, v in aggregate_dynamics(evaluated).items()})
-    for source, ep_metrics in by_source.items():
-        results.update({f"eval/{source}/dynamics/{k}": v for k, v in aggregate_dynamics(ep_metrics).items()})
-    return results
+    return _summarize_eval_results(episodes, segments, net)
 
 
 def atomic_save(payload, path):

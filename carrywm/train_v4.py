@@ -147,6 +147,13 @@ def check_resume(ck, args, version):
     for key in keys:
         if ck['config'][key] != getattr(args, key):
             raise ValueError(f'--resume requires the saved {key} value')
+    for key, default in (('motion_split', 'train'), ('cfgen_train_pack', None), ('val_pack', None)):
+        saved = ck['config'].get(key, default)
+        current = getattr(args, key, default)
+        if isinstance(current, Path):
+            current = str(current)
+        if saved != current:
+            raise ValueError(f'--resume requires the saved {key} value')
 
 
 def _reserve_collection_headroom(device, minimum):
@@ -234,11 +241,17 @@ def _run(args, version, learner_type):
             'defer_recovery': getattr(args, 'defer_recovery', False),
             'recovery_workers': getattr(args, 'recovery_workers', None),
         }
+    cfgen_pool = None
+    if getattr(args, 'cfgen_train_pack', None) is not None:
+        from .official_pool import load_official_pack
+        cfgen_pool, _ = load_official_pack(args.cfgen_train_pack)
     env = WarpCarryWorlds(
         args.sim_root, args.motion_dir, num_envs=args.num_envs,
         seed=args.seed + old_ticks, device=device, cfgen_ratio=args.cfgen_ratio,
         cfgen_cache_dir=args.cfgen_cache_dir, use_cuda_graph=args.cuda_graph,
         teacher_history=(teacher_init > 0.0 and first <= teacher_decay),
+        motion_split=getattr(args, 'motion_split', 'train'),
+        cfgen_pool=cfgen_pool,
         **env_kwargs,
     )
     if stage_state is not None:
@@ -248,7 +261,9 @@ def _run(args, version, learner_type):
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     config.update(version=version, replay_ratio=REPLAY_RATIO, wm_horizon=base.WM_STEPS,
                   actor_horizon=base.HORIZON, physics='mujoco_warp', torch=str(torch.__version__),
-                  hardware=torch.cuda.get_device_name(device))
+                  hardware=torch.cuda.get_device_name(device),
+                  num_motion_clips=len(env.envs[0].paths),
+                  num_cfgen_pool_clips=len(cfgen_pool) if cfgen_pool is not None else 0)
     if version == 7:
         config.update(replay_steps_per_env=replay.rows, goal_dim=122, wm_palm_features=6,
                       stage_uniform_fraction=0.5, teacher_free=True)

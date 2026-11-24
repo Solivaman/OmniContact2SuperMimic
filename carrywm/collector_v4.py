@@ -52,6 +52,9 @@ class VectorCollector:
         proto = self.env.envs[0]
         static_clips = [scene.frames for scene in getattr(proto, "scenes", {}).values()]
         static_clips.extend(frames for frames, _ in getattr(proto, "_plan_cache", {}).values())
+        pool = getattr(proto, "cfgen_pool", None)
+        if pool:
+            static_clips.extend(entry.frames for entry in pool)
         if static_clips:
             self.replay.register_clips(static_clips, static=True)
 

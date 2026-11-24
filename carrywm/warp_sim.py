@@ -353,7 +353,7 @@ class WarpCarryWorlds:
                  cfgen_goal_noise_std_m=0., device="cuda:0", nconmax=64, njmax=256,
                  teacher_history=False, cfgen_cache_dir=None, plan_workers=None,
                  recovery_workers=None, use_cuda_graph=True, v7=False, gpu_recovery=False,
-                 defer_recovery=False):
+                 defer_recovery=False, *, motion_split=None, cfgen_pool=None):
         if num_envs < 1 or nconmax < 1 or njmax < 1:
             raise ValueError("World count and contact/constraint capacities must be positive")
         self.num_envs = num_envs
@@ -391,7 +391,10 @@ class WarpCarryWorlds:
 
         if v7 and teacher_history:
             raise ValueError("V7 uses only student actions")
-        prototype = _Episode(sim_root, motion_dir, seed, split, cfgen_ratio, cfgen_goal_noise_std_m, v7=v7)
+        prototype = _Episode(
+            sim_root, motion_dir, seed, split, cfgen_ratio, cfgen_goal_noise_std_m,
+            v7=v7, motion_split=motion_split, cfgen_pool=cfgen_pool,
+        )
         self.stage_sampler = prototype.stage_sampler if v7 else None
         model = _scene(prototype.root, (.15, .15, .15), headless=True)
         self._host = model
@@ -406,7 +409,7 @@ class WarpCarryWorlds:
         prototype._plan_cache = {}
         # Each fixed training file supplies at most one initial zero-noise plan.
         # Recovery references still use the actual live robot and box poses.
-        prototype.reference_plan = lru_cache(maxsize=len(prototype.paths))(_make_plan)
+        prototype.reference_plan = lru_cache(maxsize=max(1, len(prototype.paths)))(_make_plan)
 
         for i in range(num_envs):
             e = copy.copy(prototype)
@@ -432,7 +435,7 @@ class WarpCarryWorlds:
         self._table2_geom = e0.tables_geom[1]
         self._table2_half_z = float(model.geom_size[self._table2_geom, 2])
 
-        if split == "train" and cfgen_ratio > 0 and cfgen_goal_noise_std_m == 0:
+        if split == "train" and cfgen_ratio > 0 and cfgen_goal_noise_std_m == 0 and prototype.cfgen_pool is None:
             _warm_cfgen_cache(prototype, self._table2_geom, model, cfgen_cache_dir, plan_workers)
 
         wp.init()

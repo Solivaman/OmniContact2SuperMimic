@@ -1,4 +1,5 @@
 """50 Hz CPU MuJoCo collection with a free box and the official CF-Gen planner."""
+import copy
 from functools import lru_cache
 from itertools import product
 from pathlib import Path
@@ -30,10 +31,10 @@ def _matrix(quat):
     return np.stack(values,axis=-1).reshape(*quat.shape[:-1],3,3)
 
 
-@lru_cache(maxsize=6)
-def _scene(root, half, headless=False):
+@lru_cache(maxsize=2)
+def _compile_scene(root, half, headless=False):
     """Compile actual collision geometry, broadphase, mass and inertia per size."""
-    scene = root / "g1_description" / "omnicontact_carry_box.xml"
+    scene = Path(root).resolve() / "g1_description" / "omnicontact_carry_box.xml"
     xml = ET.parse(scene)
     size = " ".join(str(v) for v in half)
     for name in ("box_geom", "ghost_box_geom"):
@@ -59,6 +60,48 @@ def _scene(root, half, headless=False):
     model.opt.timestep = .005
     if model.nu != 29 or not np.array_equal(model.jnt_qposadr[model.actuator_trnid[:, 0]], np.arange(7,36)):
         raise ValueError("Scene actuator order differs from the released G1 29-DoF carry scene")
+    return model
+
+
+@lru_cache(maxsize=2)
+def _scene(root, half, headless=False):
+    """Return a cached MjModel for the given box half-extents via fast base-model scaling."""
+    root = Path(root).resolve()
+    half_tup = tuple(float(v) for v in half)
+    base_half = (0.15, 0.15, 0.15)
+    if half_tup == base_half:
+        return _compile_scene(root, base_half, headless=headless)
+    base = _compile_scene(root, base_half, headless=headless)
+    model = copy.copy(base)
+    half_arr = np.asarray(half_tup, dtype=np.float64)
+    x, y, z = 2.0 * half_arr
+    inertia_unit = np.array([y * y + z * z, x * x + z * z, x * x + y * y], dtype=np.float64) / 12.0
+
+    def _resize_box(geom_name, body_name, *, update_mass):
+        gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, geom_name)
+        bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, body_name)
+        if gid < 0 or bid < 0:
+            return
+        model.geom_size[gid] = half_arr
+        model.geom_aabb[gid, :3] = 0.0
+        model.geom_aabb[gid, 3:] = half_arr
+        model.geom_rbound[gid] = float(np.linalg.norm(half_arr))
+        bvh_adr = int(model.body_bvhadr[bid])
+        bvh_num = int(model.body_bvhnum[bid])
+        if bvh_num > 0:
+            model.bvh_aabb[bvh_adr : bvh_adr + bvh_num, :3] = 0.0
+            model.bvh_aabb[bvh_adr : bvh_adr + bvh_num, 3:] = half_arr
+        if update_mass:
+            mass = 1000.0 * (x * y * z)
+            model.body_mass[bid] = mass
+            model.body_subtreemass[bid] = mass
+        model.body_inertia[bid] = model.body_mass[bid] * inertia_unit
+
+    _resize_box("box_geom", "box", update_mass=False)
+    if not headless:
+        _resize_box("ghost_box_geom", "ghost_box", update_mass=True)
+    mj.mj_setConst(model, mj.MjData(model))
+    model.stat.extent = base.stat.extent
     return model
 
 
@@ -115,7 +158,7 @@ class CarryEnv:
     """One physical simulator. step() never resets or replaces the target clip."""
 
     def __init__(self, sim_root, motion_dir, seed=42, split="train", cfgen_ratio=.1,
-                 cfgen_goal_noise_std_m=None, v7=False):
+                 cfgen_goal_noise_std_m=None, v7=False, *, motion_split=None, cfgen_pool=None):
         if not 0 <= cfgen_ratio <= 1:
             raise ValueError("cfgen_ratio must be a probability")
         if cfgen_goal_noise_std_m is None:
@@ -126,8 +169,15 @@ class CarryEnv:
         self.stage_sampler = StageSampler() if v7 and split == "train" else None
         self.cfgen_goal_noise_std_m = cfgen_goal_noise_std_m
         self.root = Path(sim_root).resolve()
-        self.paths = split_paths(motion_dir, split)
+        self.motion_split = motion_split or split
+        self.paths = split_paths(motion_dir, self.motion_split) if motion_dir is not None else ()
+        self.cfgen_pool = tuple(cfgen_pool) if cfgen_pool is not None else None
+        if not self.paths and self.cfgen_pool is None:
+            raise ValueError("Provide motion_dir or cfgen_pool")
+        if cfgen_ratio < 1.0 and not self.paths:
+            raise ValueError("cfgen_ratio < 1 requires motion_dir clips")
         self.split, self.cfgen_ratio = split, cfgen_ratio
+        self.bench_type = None
         self.rng = np.random.default_rng(seed)
         self.cfg = yaml.safe_load((self.root / "policy/omnicontact/config/OmniContact.yaml").read_text())
         if not np.array_equal(self.cfg["lab2mj"], LAB2MJ):
@@ -214,7 +264,7 @@ class CarryEnv:
         self._clip_catalogue = None
         scene = self._load_scene(path)
         self._bind_scene(scene.half)
-        self.source, self.name = source, path.stem
+        self.source, self.name, self.bench_type = source, path.stem, None
         self.d.mocap_pos[self.table_ids] = scene.tables
         self.goal = scene.frames[-1, 104:107].copy()
         self.clip, self.phase = scene.frames, None
@@ -242,6 +292,30 @@ class CarryEnv:
             if source == "npz":
                 twists = scene.frame_twists[self.index]
             elif self.index:
+                twists = catalogue.twists[self.index]
+        self._set_main_pose(self.clip[self.index], twists)
+
+    def _load_cfgen_pool_episode(self, entry, stage):
+        self._clip_catalogue = None
+        self._bind_scene(entry.half)
+        self.source, self.name, self.bench_type = "cfgen", entry.label, entry.bench_type
+        self.d.mocap_pos[self.table_ids] = entry.tables
+        self.goal = entry.goal.copy()
+        self.clip, self.phase = entry.frames, entry.phase
+        self._teacher_ankles = None
+        self.index = 0
+        twists = np.zeros((4, 3), dtype=np.float32)
+        self.start_stage = "approach"
+        if self.stage_sampler is not None:
+            catalogue = self.stage_sampler.catalogue(
+                self.root, self.clip, self.half, "cfgen", self.phase,
+                entry.tables, self.m.geom_size[self.tables_geom],
+                precomputed_valid=entry.valid_mask,
+            )
+            self._clip_catalogue = catalogue
+            self.index = self.stage_sampler.choose(catalogue, "cfgen", self.rng, stage)
+            self.start_stage = STAGES[catalogue.labels[self.index]]
+            if self.index:
                 twists = catalogue.twists[self.index]
         self._set_main_pose(self.clip[self.index], twists)
 
@@ -297,20 +371,38 @@ class CarryEnv:
                 source = "cfgen" if self.rng.random() < self.cfgen_ratio else "npz"
             if source not in {"npz", "cfgen"}:
                 raise ValueError(f"Unknown reference source {source}")
-            path = self.paths[self.rng.integers(len(self.paths))]
-            try:
-                self._load_main_episode(path, source, stage)
-            except NoStageStart:
-                # Keep reference source/ratio intact if a scene has no eligible frame.
-                others = [candidate for candidate in self.paths if candidate != path]
-                for i in self.rng.permutation(len(others)):
-                    try:
-                        self._load_main_episode(others[int(i)], source, stage)
-                        break
-                    except NoStageStart:
-                        continue
-                else:
-                    raise
+            if source == "cfgen" and self.cfgen_pool is not None:
+                pool = self.cfgen_pool
+                idx = int(self.rng.integers(len(pool)))
+                try:
+                    self._load_cfgen_pool_episode(pool[idx], stage)
+                except NoStageStart:
+                    others = [j for j in range(len(pool)) if j != idx]
+                    for j in self.rng.permutation(others):
+                        try:
+                            self._load_cfgen_pool_episode(pool[int(j)], stage)
+                            break
+                        except NoStageStart:
+                            continue
+                    else:
+                        raise
+            else:
+                if not self.paths:
+                    raise ValueError(f"No MoCap paths available for source {source!r}")
+                path = self.paths[self.rng.integers(len(self.paths))]
+                try:
+                    self._load_main_episode(path, source, stage)
+                except NoStageStart:
+                    # Keep reference source/ratio intact if a scene has no eligible frame.
+                    others = [candidate for candidate in self.paths if candidate != path]
+                    for i in self.rng.permutation(len(others)):
+                        try:
+                            self._load_main_episode(others[int(i)], source, stage)
+                            break
+                        except NoStageStart:
+                            continue
+                    else:
+                        raise
             self.episode += 1
         self.start_index = self.index
         self.context = np.concatenate((self.half, self.m.body("box").mass,
