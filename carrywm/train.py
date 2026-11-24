@@ -5,6 +5,7 @@ from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager, nullcontext
 import fcntl
 import json
+import math
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -27,6 +28,8 @@ HORIZON = 32
 ROLLOUT_CHUNK = 4
 GAMMA = 0.99
 LAMBDA = 0.95
+DEFAULT_LR_FINAL_FRAC = 0.03
+DEFAULT_LR_COSINE_FRAC = 250_000 / 320_000
 # Per-channel proprioception/box observation noise scales matching CarryGeometry.observation (141-dim).
 OBS_NOISE_BASE = (
     (0.01,) * 15   # ee_local_pos (5 x 3)
@@ -69,6 +72,14 @@ def args_from_cli(argv=None, *, configure=None):
     p.add_argument("--decoder-width", type=int, default=2048)
     p.add_argument("--wm-width", type=int, default=2048)
     p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant",
+                   help="Shared LR schedule across WM, actor, and critic")
+    p.add_argument("--lr-final-frac", type=float, default=DEFAULT_LR_FINAL_FRAC,
+                   help="Final LR multiplier after cosine decay (SuperMimic Table A.5: 0.03)")
+    p.add_argument("--lr-cosine-frac", type=float, default=DEFAULT_LR_COSINE_FRAC,
+                   help="Fraction of --iterations over which LR decays (250k / 320k = 0.78125)")
+    p.add_argument("--lr-cosine-iters", type=int, default=None,
+                   help="Optional explicit cosine decay length in iterations")
     p.add_argument("--drop-penalty", type=float, default=1.)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--eval-every", type=int, default=250)
@@ -95,7 +106,43 @@ def args_from_cli(argv=None, *, configure=None):
         p.error("sampling probabilities must be in [0, 1]")
     if a.warmup_steps < WM_STEPS or a.capacity < WM_STEPS:
         p.error("warmup-steps and capacity must cover at least eight transitions")
+    if not math.isfinite(a.lr) or a.lr <= 0:
+        p.error("lr must be positive and finite")
+    if not math.isfinite(a.lr_final_frac) or not 0 < a.lr_final_frac <= 1:
+        p.error("lr-final-frac must be in (0, 1]")
+    if not math.isfinite(a.lr_cosine_frac) or not 0 < a.lr_cosine_frac <= 1:
+        p.error("lr-cosine-frac must be in (0, 1]")
+    if a.lr_cosine_iters is not None and a.lr_cosine_iters < 1:
+        p.error("lr-cosine-iters must be positive")
     return a
+
+
+def resolve_lr_cosine_iters(iterations, lr_cosine_frac=DEFAULT_LR_COSINE_FRAC, lr_cosine_iters=None):
+    """Return the positive number of iterations spanned by the cosine decay segment."""
+    if lr_cosine_iters is not None:
+        return max(1, int(lr_cosine_iters))
+    return max(1, round(float(lr_cosine_frac) * int(iterations)))
+
+
+def lr_schedule_factor(
+    iteration,
+    *,
+    iterations,
+    schedule="constant",
+    lr_final_frac=DEFAULT_LR_FINAL_FRAC,
+    lr_cosine_frac=DEFAULT_LR_COSINE_FRAC,
+    lr_cosine_iters=None,
+):
+    """SuperMimic Table A.5 shared schedule: cosine decay 1 -> final_frac, then constant."""
+    if schedule == "constant":
+        return 1.0
+    if schedule != "cosine":
+        raise ValueError(f"Unknown lr_schedule {schedule!r}")
+    span = resolve_lr_cosine_iters(iterations, lr_cosine_frac, lr_cosine_iters)
+    step_zero_based = max(0, int(iteration) - 1)
+    progress = min(step_zero_based, span) / span
+    final_frac = float(lr_final_frac)
+    return final_frac + (1.0 - final_frac) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def sync(device):
@@ -162,7 +209,9 @@ class Learner:
                              goal_dim=goal_dim).to(self.device)
         self.models = [self.wm, self.actor, self.critic]
         adam_kw = {"fused": True} if self.device.type == "cuda" else {}
-        self.optimizers = [torch.optim.Adam(m.parameters(), lr=args.lr, **adam_kw) for m in self.models]
+        self.base_lr = float(args.lr)
+        self.lr_factor = 1.0
+        self.optimizers = [torch.optim.Adam(m.parameters(), lr=self.base_lr, **adam_kw) for m in self.models]
         obs_noise_scale = float(getattr(args, "obs_noise_scale", 0.0))
         self._obs_noise_std = (
             torch.tensor(OBS_NOISE_BASE, dtype=torch.float32, device=self.device) * obs_noise_scale
@@ -187,6 +236,26 @@ class Learner:
                 self._compiled_collect_act = torch.compile(self._collect_act_impl)
             except Exception as exc:
                 warnings.warn(f"torch.compile unavailable, running eager mode: {exc}", RuntimeWarning)
+
+    def set_lr(self, iteration):
+        """Update WM, actor, and critic optimizer LRs for the 1-based global iteration."""
+        factor = lr_schedule_factor(
+            iteration,
+            iterations=self.args.iterations,
+            schedule=getattr(self.args, "lr_schedule", "constant"),
+            lr_final_frac=getattr(self.args, "lr_final_frac", DEFAULT_LR_FINAL_FRAC),
+            lr_cosine_frac=getattr(self.args, "lr_cosine_frac", DEFAULT_LR_COSINE_FRAC),
+            lr_cosine_iters=getattr(self.args, "lr_cosine_iters", None),
+        )
+        lr_value = self.base_lr * factor
+        for opt in self.optimizers:
+            for group in opt.param_groups:
+                if torch.is_tensor(group.get("lr")):
+                    group["lr"].fill_(lr_value)
+                else:
+                    group["lr"] = lr_value
+        self.lr_factor = factor
+        return factor
 
     def autocast(self):
         if self.args.precision == "bf16":
@@ -872,6 +941,7 @@ def _train_locked(args, version, learner_type, wm_iteration):
     for it in range(first,args.iterations+1):
         sync(device)
         tick=time.perf_counter()
+        lr_factor = net.set_lr(it)
         if gpu:
             torch.cuda.reset_peak_memory_stats(device)
         stats = collector.collect(args.collect_steps,args.teacher_probability,args.action_noise)
@@ -899,6 +969,7 @@ def _train_locked(args, version, learner_type, wm_iteration):
         sync(device)
         after_policy=time.perf_counter()
         stats.update({"iteration":it,"batch_size":batch,"real_steps":collector.steps+old_steps,
+                      "lr_factor":lr_factor,"lr":net.base_lr*lr_factor,
                       "timing/collect_sec":after_collect-tick,"timing/wm_sec":after_wm-after_collect,
                       "timing/policy_sec":after_policy-after_wm})
         if gpu:

@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import copy
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -154,6 +155,17 @@ def check_resume(ck, args, version):
             current = str(current)
         if saved != current:
             raise ValueError(f'--resume requires the saved {key} value')
+    saved_sched = ck['config'].get('lr_schedule', 'constant')
+    if saved_sched != getattr(args, 'lr_schedule', 'constant'):
+        raise ValueError('--resume requires the saved lr_schedule value')
+    for key, default in (('lr_final_frac', base.DEFAULT_LR_FINAL_FRAC),
+                         ('lr_cosine_frac', base.DEFAULT_LR_COSINE_FRAC)):
+        saved = float(ck['config'].get(key, default))
+        current = float(getattr(args, key, default))
+        if not math.isclose(saved, current, rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError(f'--resume requires the saved {key} value')
+    if ck['config'].get('lr_cosine_iters', None) != getattr(args, 'lr_cosine_iters', None):
+        raise ValueError('--resume requires the saved lr_cosine_iters value')
 
 
 def _reserve_collection_headroom(device, minimum):
@@ -263,7 +275,11 @@ def _run(args, version, learner_type):
                   actor_horizon=base.HORIZON, physics='mujoco_warp', torch=str(torch.__version__),
                   hardware=torch.cuda.get_device_name(device),
                   num_motion_clips=len(env.envs[0].paths),
-                  num_cfgen_pool_clips=len(cfgen_pool) if cfgen_pool is not None else 0)
+                  num_cfgen_pool_clips=len(cfgen_pool) if cfgen_pool is not None else 0,
+                  lr_cosine_iters_resolved=(
+                      base.resolve_lr_cosine_iters(args.iterations, args.lr_cosine_frac, args.lr_cosine_iters)
+                      if getattr(args, 'lr_schedule', 'constant') == 'cosine' else None
+                  ))
     if version == 7:
         config.update(replay_steps_per_env=replay.rows, goal_dim=122, wm_palm_features=6,
                       stage_uniform_fraction=0.5, teacher_free=True)
@@ -347,6 +363,7 @@ def _run(args, version, learner_type):
         torch.cuda.reset_peak_memory_stats(device)
         for iteration in range(first, args.iterations + 1):
             phase = 'collection'
+            lr_factor = net.set_lr(iteration)
             ep_teacher = teacher_schedule(iteration, teacher_init, teacher_decay)
             bc_w = teacher_schedule(iteration, teacher_bc_weight, teacher_decay)
             if env.teacher_history and ep_teacher <= 0.0:
@@ -408,6 +425,7 @@ def _run(args, version, learner_type):
                 torch.cuda.reset_peak_memory_stats(device)
             stats.update(
                 iteration=iteration, real_steps=old_steps + collector.steps, batch_size=args.batch_size,
+                lr_factor=lr_factor, lr=net.base_lr * lr_factor,
                 **{'sim/new_transitions': new_steps, 'sim/num_envs': args.num_envs,
                    'replay/ratio': WM_SAMPLES / new_steps, 'timing/collect_sec': after_collect - tick,
                    'timing/wm_sec': after_wm - after_collect, 'timing/policy_sec': after_policy - after_wm,
