@@ -29,6 +29,7 @@ from .sim import (
     _matrix,
     _scene,
     _v7_recovery_plan,
+    validate_box_dr,
 )
 
 
@@ -353,13 +354,22 @@ class WarpCarryWorlds:
                  cfgen_goal_noise_std_m=0., device="cuda:0", nconmax=64, njmax=256,
                  teacher_history=False, cfgen_cache_dir=None, plan_workers=None,
                  recovery_workers=None, use_cuda_graph=True, v7=False, gpu_recovery=False,
-                 defer_recovery=False, *, motion_split=None, cfgen_pool=None):
+                 defer_recovery=False, *, motion_split=None, cfgen_pool=None,
+                 reset_sampling="failure", return_sampler_cfg=None, return_max_step_reward=1.0,
+                 box_mass_scale_range=(1.0, 1.0), box_friction_range=None):
         if num_envs < 1 or nconmax < 1 or njmax < 1:
             raise ValueError("World count and contact/constraint capacities must be positive")
+        box_mass_scale_range, box_friction_range = validate_box_dr(
+            box_mass_scale_range, box_friction_range
+        )
         self.num_envs = num_envs
         self.device = torch.device(device)
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
+        self._has_box_dr = (split == "train") and (
+            box_mass_scale_range != (1.0, 1.0) or box_friction_range is not None
+        )
+        self._box_friction_dr = (split == "train") and (box_friction_range is not None)
         self.teacher_history = teacher_history
         self._use_cuda_graph = bool(use_cuda_graph) and self.device.type == "cuda"
         self._batch_reset = v7 and self.device.type == "cuda" and not teacher_history
@@ -394,12 +404,21 @@ class WarpCarryWorlds:
         prototype = _Episode(
             sim_root, motion_dir, seed, split, cfgen_ratio, cfgen_goal_noise_std_m,
             v7=v7, motion_split=motion_split, cfgen_pool=cfgen_pool,
+            reset_sampling=reset_sampling, return_sampler_cfg=return_sampler_cfg,
+            return_num_envs=num_envs, return_max_step_reward=return_max_step_reward,
+            return_device=self.device,
+            box_mass_scale_range=box_mass_scale_range, box_friction_range=box_friction_range,
         )
+        prototype._warp_owned = True
         self.stage_sampler = prototype.stage_sampler if v7 else None
         model = _scene(prototype.root, (.15, .15, .15), headless=True)
         self._host = model
         self._box = model.geom("box_geom").id
         self._box_body = model.body("box").id
+        if self._box_friction_dr:
+            model = copy.copy(model)
+            model.geom_priority = model.geom_priority.copy()
+            model.geom_priority[self._box] = 1
         self._scratch = copy.copy(model)
         self._scratch_data = mj.MjData(self._scratch)
         self._geometry_cache = {}
@@ -449,10 +468,13 @@ class WarpCarryWorlds:
         with wp.ScopedDevice(str(self.device)), self._stream():
             self.m = mjw.put_model(model)
             self.d = mjw.make_data(model, nworld=num_envs, nconmax=nconmax, njmax=njmax)
-            # Expand the model fields whose compiled values vary with box dimensions.
+            # Expand the model fields whose compiled values vary with box dimensions or DR.
             self._model_views = {}
-            for key in ("geom_size", "geom_aabb", "geom_rbound", "body_inertia",
-                        "body_invweight0", "dof_invweight0"):
+            view_keys = ["geom_size", "geom_aabb", "geom_rbound", "body_inertia",
+                         "body_invweight0", "dof_invweight0"]
+            if self._has_box_dr:
+                view_keys.extend(["body_mass", "body_subtreemass", "geom_friction"])
+            for key in view_keys:
                 arr = getattr(self.m, key)
                 expanded = wp.array(np.repeat(arr.numpy(), num_envs, axis=0), dtype=arr.dtype)
                 setattr(self.m, key, expanded)
@@ -697,7 +719,10 @@ class WarpCarryWorlds:
             from .reset_v7 import reset_batch
             return reset_batch(self, ids, source)
 
+        from .reset_v7 import apply_box_dr_to_stacked, sync_box_context
+
         new = []
+        new_episodes = []
         variants = []
         init_boxes, goals, on_floors, clip_lens, indices = [], [], [], [], []
         states_host, contexts_host = [], []
@@ -706,11 +731,11 @@ class WarpCarryWorlds:
             e.in_reset = True
             e.reset(source)
             e.in_reset = False
-            v_cpu = self._geometry(e.half)
             v_gpu = self._geometry_gpu(e.half)
-            e.context[4:7] = v_cpu["body_inertia"][self._box_body]
+            sync_box_context(self, e)
             if e.source != "recovery":
                 new.append(i)
+                new_episodes.append(e)
                 variants.append(v_gpu)
             goal_bottom = float(e.goal[2] - np.abs(_matrix(e.clip[-1, 107:111])[2]) @ e.half)
             tabletop = float(e.d.mocap_pos[self._table2_id, 2] + self._table2_half_z)
@@ -735,7 +760,10 @@ class WarpCarryWorlds:
                     torch.cuda.current_stream(self.device).wait_stream(self._cuda_stream)
                 idx = torch.tensor(new, dtype=torch.int64, device=self.device)
                 for key, view in self._model_views.items():
-                    view.index_copy_(0, idx, torch.stack([v[key] for v in variants], dim=0))
+                    vals = apply_box_dr_to_stacked(
+                        self, key, torch.stack([v[key] for v in variants], dim=0), new_episodes
+                    )
+                    view.index_copy_(0, idx, vals)
                 for view, key in ((self._qpos, "qpos"), (self._qvel, "qvel"), (self._mocap, "mocap_pos")):
                     arr = np.stack([getattr(self.envs[i].d, key) for i in new])
                     view.index_copy_(0, idx, torch.as_tensor(arr, device=self.device, dtype=view.dtype))
@@ -949,6 +977,8 @@ class WarpCarryWorlds:
                             "half": e.half.copy(),
                             "goal": e.goal.copy(),
                             "name": e.name,
+                            "box_mass_scale": e.box_mass_scale,
+                            "box_friction": None if e.box_friction is None else e.box_friction.copy(),
                         }
                         self._recovery_futures[i] = self._submit_recovery(i)
                 elif self._recovery_futures is not None:

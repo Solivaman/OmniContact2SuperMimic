@@ -11,14 +11,31 @@ import mujoco as mj
 import numpy as np
 import yaml
 
-from .stages_v7 import NoStageStart, STAGES, StageSampler
-from .data import OFFSETS, LAB2MJ, MJ2LAB, LINKS, generate_clip, load_demo, raw_window, split_paths
+from .stages_v7 import NoStageStart, ReturnSamplerCfg, STAGES, StageSampler
+from .data import OFFSETS, LAB2MJ, MJ2LAB, LINKS, generate_clip, load_demo, split_paths
 
 
 DEFAULT_CFGEN_GOAL_NOISE_STD_M = 0.005
 FALL_MIN_HEIGHT_M = 0.15
 FALL_HEIGHT_ERR_M = 0.30
 FALL_TILT_ERR = 0.60
+
+
+def validate_box_dr(box_mass_scale_range=(1.0, 1.0), box_friction_range=None):
+    """Validate light box mass-scale and friction domain randomization bounds."""
+    if len(box_mass_scale_range) != 2:
+        raise ValueError("box_mass_scale_range must have two endpoints (min, max)")
+    m_lo, m_hi = float(box_mass_scale_range[0]), float(box_mass_scale_range[1])
+    if not (np.isfinite(m_lo) and np.isfinite(m_hi)) or m_lo <= 0.0 or m_lo > m_hi:
+        raise ValueError(f"Invalid box_mass_scale_range {(m_lo, m_hi)!r}")
+    if box_friction_range is None:
+        return (m_lo, m_hi), None
+    if len(box_friction_range) != 2:
+        raise ValueError("box_friction_range must have two endpoints (min, max)")
+    f_lo, f_hi = float(box_friction_range[0]), float(box_friction_range[1])
+    if not (np.isfinite(f_lo) and np.isfinite(f_hi)) or f_lo <= 0.0 or f_lo > f_hi:
+        raise ValueError(f"Invalid box_friction_range {(f_lo, f_hi)!r}")
+    return (m_lo, m_hi), (f_lo, f_hi)
 
 
 def _matrix(quat):
@@ -158,15 +175,39 @@ class CarryEnv:
     """One physical simulator. step() never resets or replaces the target clip."""
 
     def __init__(self, sim_root, motion_dir, seed=42, split="train", cfgen_ratio=.1,
-                 cfgen_goal_noise_std_m=None, v7=False, *, motion_split=None, cfgen_pool=None):
+                 cfgen_goal_noise_std_m=None, v7=False, *, motion_split=None, cfgen_pool=None,
+                 reset_sampling="failure", return_sampler_cfg=None, return_num_envs=1,
+                 return_max_step_reward=1.0, return_device="cpu",
+                 box_mass_scale_range=(1.0, 1.0), box_friction_range=None):
         if not 0 <= cfgen_ratio <= 1:
             raise ValueError("cfgen_ratio must be a probability")
         if cfgen_goal_noise_std_m is None:
             cfgen_goal_noise_std_m = 0. if v7 else DEFAULT_CFGEN_GOAL_NOISE_STD_M
         if not np.isfinite(cfgen_goal_noise_std_m) or cfgen_goal_noise_std_m < 0:
             raise ValueError("CF-Gen goal noise standard deviation must be finite and nonnegative")
+        self.box_mass_scale_range, self.box_friction_range = validate_box_dr(
+            box_mass_scale_range, box_friction_range
+        )
+        self.split, self.cfgen_ratio = split, cfgen_ratio
+        self._has_box_dr = (self.split == "train") and (
+            self.box_mass_scale_range != (1.0, 1.0) or self.box_friction_range is not None
+        )
+        self._box_friction_dr = (self.split == "train") and (self.box_friction_range is not None)
+        self._warp_owned = False
+        self.box_mass_scale = 1.0
+        self.box_friction = None
         self.v7 = v7
-        self.stage_sampler = StageSampler() if v7 and split == "train" else None
+        self.stage_sampler = (
+            StageSampler(
+                sampling_mode=reset_sampling,
+                return_cfg=return_sampler_cfg,
+                num_envs=return_num_envs,
+                max_step_reward=return_max_step_reward,
+                device=return_device,
+            )
+            if v7 and split == "train"
+            else None
+        )
         self.cfgen_goal_noise_std_m = cfgen_goal_noise_std_m
         self.root = Path(sim_root).resolve()
         self.motion_split = motion_split or split
@@ -176,7 +217,6 @@ class CarryEnv:
             raise ValueError("Provide motion_dir or cfgen_pool")
         if cfgen_ratio < 1.0 and not self.paths:
             raise ValueError("cfgen_ratio < 1 requires motion_dir clips")
-        self.split, self.cfgen_ratio = split, cfgen_ratio
         self.bench_type = None
         self.rng = np.random.default_rng(seed)
         self.cfg = yaml.safe_load((self.root / "policy/omnicontact/config/OmniContact.yaml").read_text())
@@ -192,6 +232,16 @@ class CarryEnv:
 
     def _bind_scene(self, half):
         model = _scene(self.root, tuple(half))
+        if self._has_box_dr:
+            model = copy.copy(model)
+            for field in (
+                "body_mass", "body_subtreemass", "body_inertia",
+                "body_invweight0", "dof_invweight0", "geom_friction", "geom_priority",
+            ):
+                setattr(model, field, getattr(model, field).copy())
+            if self._box_friction_dr:
+                gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, "box_geom")
+                model.geom_priority[gid] = 1
         self._set_scene(model, mj.MjData(model), half)
 
     def _set_scene(self, model, data, half):
@@ -199,7 +249,13 @@ class CarryEnv:
         self.half = np.asarray(half, dtype=float)
         self.bp = int(self.m.joint("box").qposadr[0])
         self.bv = int(self.m.joint("box").dofadr[0])
+        self._box_body_id = int(self.m.body("box").id)
         self.box_geom = self.m.geom("box_geom").id
+        self._base_box_mass = float(self.m.body_mass[self._box_body_id])
+        self._base_box_inertia = self.m.body_inertia[self._box_body_id].copy()
+        self._base_box_invweight0 = self.m.body_invweight0[self._box_body_id].copy()
+        self._base_box_dof_invweight0 = self.m.dof_invweight0[self.bv:self.bv + 6].copy()
+        self._base_box_friction = self.m.geom_friction[self.box_geom].copy()
         self.floor_geom = self.m.geom("floor").id
         self.tables_geom = [self.m.geom(f"plane_{j}").id for j in (1, 2)]
         self.table_ids = [int(self.m.body(f"plane_{j}_holder").mocapid[0]) for j in (1,2)]
@@ -259,6 +315,35 @@ class CarryEnv:
                 return False
         self.clip, self.phase = frames, phase
         return True
+
+    def _sample_box_dr(self):
+        if not self._has_box_dr:
+            self.box_mass_scale = 1.0
+            self.box_friction = None
+            return
+        m_lo, m_hi = self.box_mass_scale_range
+        self.box_mass_scale = float(self.rng.uniform(m_lo, m_hi)) if m_hi > m_lo else m_lo
+        if self.box_friction_range is not None:
+            f_lo, f_hi = self.box_friction_range
+            slide = float(self.rng.uniform(f_lo, f_hi)) if f_hi > f_lo else f_lo
+            self.box_friction = (
+                self._base_box_friction * (slide / self._base_box_friction[0])
+            ).astype(np.float64)
+        else:
+            self.box_friction = None
+
+    def _apply_cpu_box_dr(self):
+        if not self._has_box_dr or self._warp_owned:
+            return
+        m_scale = float(self.box_mass_scale)
+        bid = self._box_body_id
+        self.m.body_mass[bid] = self._base_box_mass * m_scale
+        self.m.body_subtreemass[bid] = self._base_box_mass * m_scale
+        self.m.body_inertia[bid] = self._base_box_inertia * m_scale
+        self.m.body_invweight0[bid] = self._base_box_invweight0 / m_scale
+        self.m.dof_invweight0[self.bv:self.bv + 6] = self._base_box_dof_invweight0 / m_scale
+        if self.box_friction is not None:
+            self.m.geom_friction[self.box_geom] = self.box_friction
 
     def _load_main_episode(self, path, source, stage):
         self._clip_catalogue = None
@@ -403,10 +488,20 @@ class CarryEnv:
                             continue
                     else:
                         raise
+            self._sample_box_dr()
+            if not self._warp_owned and self._has_box_dr:
+                self._apply_cpu_box_dr()
+                self._forward_reset()
             self.episode += 1
         self.start_index = self.index
-        self.context = np.concatenate((self.half, self.m.body("box").mass,
-                                       self.m.body("box").inertia, self.m.geom_friction[self.box_geom],
+        box_mass = np.array([self._base_box_mass * self.box_mass_scale], dtype=np.float32)
+        box_inertia = (self._base_box_inertia * self.box_mass_scale).astype(np.float32)
+        box_friction = (
+            np.asarray(self.box_friction, dtype=np.float32)
+            if self.box_friction is not None
+            else np.asarray(self._base_box_friction, dtype=np.float32)
+        )
+        self.context = np.concatenate((self.half, box_mass, box_inertia, box_friction,
                                        self.d.mocap_pos[self.table_ids].ravel())).astype(np.float32)
         self._done = False
         self._lifted = self._starts_holding() if self.v7 and self.start_index else False

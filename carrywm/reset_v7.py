@@ -47,6 +47,54 @@ def _geometry_table(world, episodes):
     return result
 
 
+def sync_box_context(world, episode):
+    """Synchronize episode.context[3:10] (box mass, inertia, friction) with episode DR state."""
+    geom = world._geometry(episode.half)
+    m_scale = float(getattr(episode, "box_mass_scale", 1.0))
+    base_mass = float(world._host.body_mass[world._box_body])
+    episode.context[3] = np.float32(base_mass * m_scale)
+    episode.context[4:7] = geom["body_inertia"][world._box_body] * m_scale
+    fric = getattr(episode, "box_friction", None)
+    episode.context[7:10] = (
+        np.asarray(fric, dtype=np.float32)
+        if fric is not None
+        else np.asarray(episode._base_box_friction, dtype=np.float32)
+    )
+
+
+def apply_box_dr_to_stacked(world, key, vals, episodes):
+    """Apply per-episode box mass/inertia/invweight0/friction randomization to stacked tensors."""
+    if not getattr(world, "_has_box_dr", False) or not episodes:
+        return vals
+    import torch
+
+    m_scales = torch.as_tensor(
+        [float(ep.box_mass_scale) for ep in episodes],
+        dtype=torch.float32,
+        device=world.device,
+    )
+    if key in ("body_mass", "body_subtreemass"):
+        vals = vals.clone()
+        vals[:, world._box_body] *= m_scales
+    elif key == "body_inertia":
+        vals = vals.clone()
+        vals[:, world._box_body] *= m_scales[:, None]
+    elif key == "body_invweight0":
+        vals = vals.clone()
+        vals[:, world._box_body] /= m_scales[:, None]
+    elif key == "dof_invweight0":
+        vals = vals.clone()
+        vals[:, world._bv:world._bv + 6] /= m_scales[:, None]
+    elif key == "geom_friction" and getattr(world, "_box_friction_dr", False):
+        vals = vals.clone()
+        frics = np.stack([
+            ep.box_friction if ep.box_friction is not None else ep._base_box_friction
+            for ep in episodes
+        ]).astype(np.float32)
+        vals[:, world._box] = torch.as_tensor(frics, dtype=vals.dtype, device=world.device)
+    return vals
+
+
 def reset_batch(world, ids, source):
     import mujoco_warp as mjw
     import torch
@@ -65,6 +113,11 @@ def reset_batch(world, ids, source):
             e.half = snap["half"].copy()
             e.goal = snap["goal"].copy()
             e.name = snap["name"]
+            if "box_mass_scale" in snap:
+                e.box_mass_scale = float(snap["box_mass_scale"])
+            if "box_friction" in snap:
+                sf = snap["box_friction"]
+                e.box_friction = None if sf is None else sf.copy()
             was_deferred = True
         e._deferred_snapshot = None
         e._defer_main_pose = e.in_reset = True
@@ -77,10 +130,11 @@ def reset_batch(world, ids, source):
             pose_episodes.append(e)
         elif was_deferred:
             normal_rows.append(row)
-        e.context[4:7] = world._geometry(e.half)["body_inertia"][world._box_body]
+        sync_box_context(world, e)
 
     _normal_poses(pose_episodes)
-    variants = _geometry_table(world, [episodes[i] for i in normal_rows])
+    normal_episodes = [episodes[i] for i in normal_rows]
+    variants = _geometry_table(world, normal_episodes)
     # Pack all per-episode float fields into a single H2D copy, including the
     # live state of successful recoveries. MjWarp resets ordinary and deferred rows.
     model = world._host
@@ -121,7 +175,10 @@ def reset_batch(world, ids, source):
             mjw.reset_data(world.m, world.d, world._reset_mask_wp)
             stream.wait_stream(world._cuda_stream)
             for key, dst in world._model_views.items():
-                dst.index_copy_(0, changed, world._reset_geometry_table[key][slots])
+                vals = apply_box_dr_to_stacked(
+                    world, key, world._reset_geometry_table[key][slots], normal_episodes
+                )
+                dst.index_copy_(0, changed, vals)
             world._qpos.index_copy_(0, changed, qp[norm])
             world._qvel.index_copy_(0, changed, qv[norm])
             world._mocap.index_copy_(0, changed, mocap[norm].reshape(-1, model.nmocap, 3))

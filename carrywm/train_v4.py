@@ -102,6 +102,12 @@ def configure(parser):
     parser.add_argument('--full-save-every', type=int, default=None,
                         help='Write full resumable checkpoint (including replay/optimizers) every N iterations; '
                              'intermediate --save-every points write lightweight weights.pt')
+    parser.add_argument('--box-mass-scale-range', type=float, nargs=2, default=(1.0, 1.0),
+                        metavar=('MIN', 'MAX'),
+                        help='Uniform training scale range for box mass (with inertia/invweight0 recomputed)')
+    parser.add_argument('--box-friction-range', type=float, nargs=2, default=None,
+                        metavar=('MIN', 'MAX'),
+                        help='Uniform training range for box slide friction (sets box geom priority=1 when active)')
     parser.set_defaults(batch_size=ACTOR_BATCH, actor_microbatch=ACTOR_BATCH,
                         checkpoint_encoder=False, critic_chunk=16384,
                         warmup_steps=NUM_ENVS * base.WM_STEPS,
@@ -124,6 +130,9 @@ def args_from_cli(argv=None, *, configure_parser=configure, world_count=NUM_ENVS
         raise ValueError('full-save-every must be positive')
     if args.capacity // args.num_envs < base.WM_STEPS or torch.device(args.device).type != 'cuda':
         raise ValueError('The vector trainer requires CUDA and room for at least eight transitions per world')
+    from .sim import validate_box_dr
+    m_range, f_range = validate_box_dr(args.box_mass_scale_range, args.box_friction_range)
+    args.box_mass_scale_range, args.box_friction_range = m_range, f_range
     return args
 
 
@@ -166,6 +175,37 @@ def check_resume(ck, args, version):
             raise ValueError(f'--resume requires the saved {key} value')
     if ck['config'].get('lr_cosine_iters', None) != getattr(args, 'lr_cosine_iters', None):
         raise ValueError('--resume requires the saved lr_cosine_iters value')
+    for key, default in (('optimizer', 'adam'), ('reset_sampling', 'failure')):
+        if ck['config'].get(key, default) != getattr(args, key, default):
+            raise ValueError(f'--resume requires the saved {key} value')
+    for key, default in (('muon_weight_decay', 0.1), ('actor_beta2', 0.999), ('actor_grad_clip_value', 0.0)):
+        saved = float(ck['config'].get(key, default))
+        current = float(getattr(args, key, default))
+        if not math.isclose(saved, current, rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError(f'--resume requires the saved {key} value')
+    saved_mass = list(ck['config'].get('box_mass_scale_range', [1.0, 1.0]))
+    curr_mass = list(getattr(args, 'box_mass_scale_range', (1.0, 1.0)))
+    if len(saved_mass) != 2 or any(not math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-12) for a, b in zip(saved_mass, curr_mass)):
+        raise ValueError('--resume requires the saved box_mass_scale_range value')
+    saved_fric = ck['config'].get('box_friction_range', None)
+    curr_fric = getattr(args, 'box_friction_range', None)
+    if (saved_fric is None) != (curr_fric is None):
+        raise ValueError('--resume requires the saved box_friction_range value')
+    if saved_fric is not None and (
+        len(saved_fric) != 2 or any(not math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-12) for a, b in zip(saved_fric, curr_fric))
+    ):
+        raise ValueError('--resume requires the saved box_friction_range value')
+    if getattr(args, 'reset_sampling', 'failure') == 'return':
+        for key, default in (('return_sampler_horizon', 20), ('return_sampler_memory', 256)):
+            if int(ck['config'].get(key, default)) != int(getattr(args, key, default)):
+                raise ValueError(f'--resume requires the saved {key} value')
+        for key, default in (('return_sampler_steepness', 25.0),
+                             ('return_sampler_explore', 0.5),
+                             ('return_sampler_keep', 0.1)):
+            saved = float(ck['config'].get(key, default))
+            current = float(getattr(args, key, default))
+            if not math.isclose(saved, current, rel_tol=1e-9, abs_tol=1e-12):
+                raise ValueError(f'--resume requires the saved {key} value')
 
 
 def _reserve_collection_headroom(device, minimum):
@@ -247,11 +287,26 @@ def _run(args, version, learner_type):
     teacher_bc_batch = int(getattr(args, 'teacher_bc_batch', 1024))
     env_kwargs = {}
     if version == 7:
+        reset_sampling = getattr(args, 'reset_sampling', 'failure')
+        return_cfg = None
+        if reset_sampling == 'return':
+            from .stages_v7 import ReturnSamplerCfg
+            return_cfg = ReturnSamplerCfg(
+                gamma=base.GAMMA,
+                horizon=int(getattr(args, 'return_sampler_horizon', 20)),
+                memory=int(getattr(args, 'return_sampler_memory', 256)),
+                steepness=float(getattr(args, 'return_sampler_steepness', 25.0)),
+                explore=float(getattr(args, 'return_sampler_explore', 0.5)),
+                keep=float(getattr(args, 'return_sampler_keep', 0.1)),
+            )
         env_kwargs = {
             'v7': True,
             'gpu_recovery': args.gpu_recovery,
             'defer_recovery': getattr(args, 'defer_recovery', False),
             'recovery_workers': getattr(args, 'recovery_workers', None),
+            'reset_sampling': reset_sampling,
+            'return_sampler_cfg': return_cfg,
+            'return_max_step_reward': float(args.critic_value_max) * (1.0 - base.GAMMA),
         }
     cfgen_pool = None
     if getattr(args, 'cfgen_train_pack', None) is not None:
@@ -264,13 +319,18 @@ def _run(args, version, learner_type):
         teacher_history=(teacher_init > 0.0 and first <= teacher_decay),
         motion_split=getattr(args, 'motion_split', 'train'),
         cfgen_pool=cfgen_pool,
+        box_mass_scale_range=getattr(args, 'box_mass_scale_range', (1.0, 1.0)),
+        box_friction_range=getattr(args, 'box_friction_range', None),
         **env_kwargs,
     )
     if stage_state is not None:
         env.stage_sampler.load_state_dict(stage_state)
     collector = VectorCollector(env, net, replay, rng)
     collector.episodes.update(episodes)
-    config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    config = {
+        k: (str(v) if isinstance(v, Path) else (list(v) if isinstance(v, tuple) else v))
+        for k, v in vars(args).items()
+    }
     config.update(version=version, replay_ratio=REPLAY_RATIO, wm_horizon=base.WM_STEPS,
                   actor_horizon=base.HORIZON, physics='mujoco_warp', torch=str(torch.__version__),
                   hardware=torch.cuda.get_device_name(device),
@@ -281,8 +341,10 @@ def _run(args, version, learner_type):
                       if getattr(args, 'lr_schedule', 'constant') == 'cosine' else None
                   ))
     if version == 7:
+        reset_sampling = getattr(args, 'reset_sampling', 'failure')
+        uniform_frac = float(getattr(args, 'return_sampler_explore', 0.5)) if reset_sampling == 'return' else 0.5
         config.update(replay_steps_per_env=replay.rows, goal_dim=122, wm_palm_features=6,
-                      stage_uniform_fraction=0.5, teacher_free=True)
+                      stage_uniform_fraction=uniform_frac, teacher_free=True)
     (output / ('resume-config.json' if args.resume else 'config.json')).write_text(json.dumps(config, indent=2) + '\n')
 
     def record(data):
@@ -445,6 +507,8 @@ def _run(args, version, learner_type):
             if should_log:
                 stats['wall_seconds'] = elapsed + time.monotonic() - start
                 stats.update({f'collect/{k}': v for k, v in collector.episodes.items()})
+                if getattr(env, 'stage_sampler', None) is not None and env.stage_sampler.return_sampler is not None:
+                    stats.update({f'collect/{k}': v for k, v in env.stage_sampler.return_sampler.metrics().items()})
                 record(stats)
         checkpointer.wait()
         summary = dict(completed_iterations=args.iterations, real_steps=old_steps + collector.steps,

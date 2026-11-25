@@ -8,6 +8,11 @@ import torch
 
 from .data import OFFSETS
 from .replay_v4 import gather_reference
+from .stages_v7 import SOURCES
+
+
+def _source_code(source):
+    return SOURCES.index(source) if source in SOURCES else -1
 
 
 class VectorCollector:
@@ -40,6 +45,8 @@ class VectorCollector:
             self.previous_gpu = torch.zeros((self.count, 29), dtype=torch.float32, device=device)
             self.clip_ids_gpu = torch.zeros(self.count, dtype=torch.int64, device=device)
             self.frames_gpu = torch.zeros(self.count, dtype=torch.int32, device=device)
+            self.sources_gpu = torch.full((self.count,), -1, dtype=torch.int64, device=device)
+            self._no_timeout_gpu = torch.zeros(self.count, dtype=torch.bool, device=device)
             self._offsets_gpu = torch.as_tensor(OFFSETS, dtype=torch.int64, device=device)
             self._one_offset_gpu = torch.tensor([1], dtype=torch.int64, device=device)
             self._gpu_gen = torch.Generator(device=device).manual_seed(int(rng.integers(0, 2**31 - 1)))
@@ -47,6 +54,8 @@ class VectorCollector:
             self.previous = np.zeros((self.count, 29), np.float32)
             self.state = np.empty((self.count, 84), np.float32)
             self.context = np.empty((self.count, 16), np.float32)
+            self.sources = np.full(self.count, -1, dtype=np.int64)
+            self.clip_lens = np.ones(self.count, dtype=np.int64)
 
     def _warm_static_clips(self):
         proto = self.env.envs[0]
@@ -109,6 +118,11 @@ class VectorCollector:
             self.context_gpu.index_copy_(0, idx_t, self.env._context_gpu.index_select(0, idx_t))
             self.previous_gpu[idx_t] = 0.0
             self.frames_gpu.index_copy_(0, idx_t, self.env._env_index.index_select(0, idx_t))
+            self.sources_gpu.index_copy_(
+                0,
+                idx_t,
+                torch.as_tensor([_source_code(envs[i].source) for i in ids], dtype=torch.int64, device=device),
+            )
             clip_inputs = []
             for i in ids:
                 gpu_clip = getattr(envs[i], "_clip_gpu", None)
@@ -193,7 +207,33 @@ class VectorCollector:
             is_teacher=teacher_mask_t,
         )
         metrics = {"sim/teacher_fraction": teacher_frac, **timing}
-        if record_reward:
+        sampler = getattr(self.env, "stage_sampler", None)
+        return_sampler = getattr(sampler, "return_sampler", None)
+        if return_sampler is not None:
+            flags_g = self.env._packed_flags[: self.count]
+            success_g = flags_g[:, 1].bool()
+            drop_g = flags_g[:, 2].bool()
+            timeout_g = flags_g[:, 3].bool()
+            fallen_g = flags_g[:, 4].bool()
+            step_rewards = net.step_rewards(
+                self.state_gpu, after_gpu, self.previous_gpu, actions, target, contacts_gpu
+            ) - net.args.drop_penalty * drop_g.to(torch.float32)
+            probs = return_sampler.record(
+                self.frames_gpu,
+                self.env._clip_len,
+                self.sources_gpu,
+                step_rewards,
+                fallen_g | drop_g,
+                success_g,
+                timeout_g,
+                self._no_timeout_gpu,
+            )
+            if probs is not None:
+                sampler.return_probs = probs
+            if record_reward:
+                reward = step_rewards.mean()
+                metrics["sim/reward"] = reward if defer_reward else reward.item()
+        elif record_reward:
             terms = net.geo.reward_terms(
                 self.state_gpu, after_gpu, self.previous_gpu, actions, target, contacts_gpu
             )
@@ -215,6 +255,8 @@ class VectorCollector:
             for i in ids:
                 env = envs[i]
                 self.state[i], self.context[i] = env.state, env.context
+                self.sources[i] = _source_code(env.source)
+                self.clip_lens[i] = len(env.clip)
                 self.episodes[f"{env.source}/started"] += 1
                 if getattr(self.env, "stage_sampler", None) is not None and env.source != "recovery":
                     self.episodes[f"stage/{env.source}/{env.start_stage}/started"] += 1
@@ -270,11 +312,36 @@ class VectorCollector:
         self.replay.append(self.state, after, self.previous, executed, contacts, self.context,
                            obs.cpu().numpy(), frames, clips, fresh)
         metrics = {"sim/teacher_fraction": len(teacher_ids) / self.count}
-        if record_reward:
+        sampler = getattr(self.env, "stage_sampler", None)
+        return_sampler = getattr(sampler, "return_sampler", None)
+        if record_reward or return_sampler is not None:
             target = gather_reference(clips, frames, (1,))[:, 0]
-            terms = net.geo.reward_terms(state, as_tensor(after), previous, action,
-                                         as_tensor(target), as_tensor(contacts))
-            metrics["sim/reward"] = sum(term.mean() for term in terms.values()).item() - net.args.drop_penalty * drops / self.count
+            if return_sampler is not None:
+                drop_arr = np.fromiter((bool(info["drop"]) for info in infos), dtype=bool, count=self.count)
+                fallen_arr = np.fromiter((bool(info["fallen"]) for info in infos), dtype=bool, count=self.count)
+                success_arr = np.fromiter((bool(info["success"]) for info in infos), dtype=bool, count=self.count)
+                timeout_arr = np.fromiter((bool(info["timeout"]) for info in infos), dtype=bool, count=self.count)
+                step_rewards = net.step_rewards(
+                    state, as_tensor(after), previous, action, as_tensor(target), as_tensor(contacts)
+                ) - net.args.drop_penalty * as_tensor(drop_arr.astype(np.float32))
+                probs = return_sampler.record(
+                    as_tensor(frames).long(),
+                    as_tensor(self.clip_lens).long(),
+                    as_tensor(self.sources).long(),
+                    step_rewards,
+                    as_tensor(fallen_arr | drop_arr).bool(),
+                    as_tensor(success_arr).bool(),
+                    as_tensor(timeout_arr).bool(),
+                    torch.zeros(self.count, dtype=torch.bool, device=device),
+                )
+                if probs is not None:
+                    sampler.return_probs = probs
+                if record_reward:
+                    metrics["sim/reward"] = step_rewards.mean().item()
+            else:
+                terms = net.geo.reward_terms(state, as_tensor(after), previous, action,
+                                             as_tensor(target), as_tensor(contacts))
+                metrics["sim/reward"] = sum(term.mean() for term in terms.values()).item() - net.args.drop_penalty * drops / self.count
         self.fresh = done.copy()
         self.state[:] = after
         self.previous = executed

@@ -148,7 +148,7 @@ class LearnerV3(Learner):
                     bc_loss = F.mse_loss(pred_act, t_act.float().clamp(-10.0, 10.0))
                     (float(bc_weight) * bc_loss).backward()
                     bc_loss_val = float(bc_loss.detach().item())
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1., error_if_nonfinite=True)
+            self._clip_actor_gradients()
             opt.step()
             opt.zero_grad(set_to_none=True)
             critic_loss = self._fit_critic(data)

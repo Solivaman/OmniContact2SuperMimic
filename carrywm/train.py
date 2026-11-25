@@ -72,6 +72,14 @@ def args_from_cli(argv=None, *, configure=None):
     p.add_argument("--decoder-width", type=int, default=2048)
     p.add_argument("--wm-width", type=int, default=2048)
     p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--optimizer", choices=("adam", "muon"), default="adam",
+                   help="Parameter optimizer: Adam everywhere, or Muon on hidden Linear matrices + Adam elsewhere")
+    p.add_argument("--muon-weight-decay", type=float, default=0.1,
+                   help="Decoupled weight decay for Muon hidden matrices (PyTorch Muon default: 0.1)")
+    p.add_argument("--actor-beta2", type=float, default=0.999,
+                   help="Adam beta2 for Actor optimizer (SuperMimic Table A.5: 0.95)")
+    p.add_argument("--actor-grad-clip-value", type=float, default=0.0,
+                   help="Optional element-wise Actor gradient clip after norm clip (SuperMimic: 0.1)")
     p.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant",
                    help="Shared LR schedule across WM, actor, and critic")
     p.add_argument("--lr-final-frac", type=float, default=DEFAULT_LR_FINAL_FRAC,
@@ -108,6 +116,12 @@ def args_from_cli(argv=None, *, configure=None):
         p.error("warmup-steps and capacity must cover at least eight transitions")
     if not math.isfinite(a.lr) or a.lr <= 0:
         p.error("lr must be positive and finite")
+    if not math.isfinite(a.muon_weight_decay) or a.muon_weight_decay < 0:
+        p.error("muon-weight-decay must be finite and nonnegative")
+    if not math.isfinite(a.actor_beta2) or not 0 < a.actor_beta2 < 1:
+        p.error("actor-beta2 must be in (0, 1)")
+    if not math.isfinite(a.actor_grad_clip_value) or a.actor_grad_clip_value < 0:
+        p.error("actor-grad-clip-value must be finite and nonnegative")
     if not math.isfinite(a.lr_final_frac) or not 0 < a.lr_final_frac <= 1:
         p.error("lr-final-frac must be in (0, 1]")
     if not math.isfinite(a.lr_cosine_frac) or not 0 < a.lr_cosine_frac <= 1:
@@ -211,7 +225,21 @@ class Learner:
         adam_kw = {"fused": True} if self.device.type == "cuda" else {}
         self.base_lr = float(args.lr)
         self.lr_factor = 1.0
-        self.optimizers = [torch.optim.Adam(m.parameters(), lr=self.base_lr, **adam_kw) for m in self.models]
+        actor_beta2 = float(getattr(args, "actor_beta2", 0.999))
+        opt_kind = getattr(args, "optimizer", "adam")
+        muon_wd = float(getattr(args, "muon_weight_decay", 0.1))
+        from .muon import build_module_optimizer
+        self.optimizers = [
+            build_module_optimizer(
+                m,
+                self.base_lr,
+                betas=(0.9, actor_beta2 if m is self.actor else 0.999),
+                optimizer=opt_kind,
+                muon_weight_decay=muon_wd,
+                adam_kwargs=adam_kw,
+            )
+            for m in self.models
+        ]
         obs_noise_scale = float(getattr(args, "obs_noise_scale", 0.0))
         self._obs_noise_std = (
             torch.tensor(OBS_NOISE_BASE, dtype=torch.float32, device=self.device) * obs_noise_scale
@@ -226,6 +254,7 @@ class Learner:
         self._compiled_imagine_chunk = self._imagine_chunk
         self._compiled_critic = self.critic
         self._compiled_collect_act = self._collect_act_impl
+        self._compiled_step_rewards = self._step_rewards_impl
         if getattr(args, "compile", False) and self.device.type == "cuda":
             try:
                 self._compiled_wm_features = torch.compile(self.wm._features)
@@ -234,8 +263,18 @@ class Learner:
                 self._compiled_imagine_chunk = torch.compile(self._imagine_chunk)
                 self._compiled_critic = torch.compile(self.critic, dynamic=True)
                 self._compiled_collect_act = torch.compile(self._collect_act_impl)
+                self._compiled_step_rewards = torch.compile(self._step_rewards_impl)
             except Exception as exc:
                 warnings.warn(f"torch.compile unavailable, running eager mode: {exc}", RuntimeWarning)
+
+    def _clip_actor_gradients(self):
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.actor.parameters(), 1.0, error_if_nonfinite=True
+        )
+        clip_value = float(getattr(self.args, "actor_grad_clip_value", 0.0))
+        if clip_value > 0.0:
+            torch.nn.utils.clip_grad_value_(self.actor.parameters(), clip_value)
+        return grad_norm
 
     def set_lr(self, iteration):
         """Update WM, actor, and critic optimizer LRs for the 1-based global iteration."""
@@ -283,6 +322,13 @@ class Learner:
     def collect_act(self, state, prev, ctx, raw_win, hist, fresh_mask):
         fn = getattr(self, "_compiled_collect_act", self._collect_act_impl)
         return fn(state, prev, ctx, raw_win, hist, fresh_mask)
+
+    def _step_rewards_impl(self, prev_state, state, prev_action, action, target, contacts):
+        return self.geo.reward(prev_state, state, prev_action, action, target, contacts)
+
+    def step_rewards(self, prev_state, state, prev_action, action, target, contacts):
+        fn = getattr(self, "_compiled_step_rewards", self._step_rewards_impl)
+        return fn(prev_state, state, prev_action, action, target, contacts)
 
     def _wm_rollout_loss(self, s, a, c, ctx):
         state = s[:, 0]
@@ -455,7 +501,7 @@ class Learner:
                 inputs, update_stats=True)
             self.optimizers[1].zero_grad(set_to_none=True)
             (-ret.mean()).backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1., error_if_nonfinite=True)
+            self._clip_actor_gradients()
         # Critic targets are fixed before any critic update; use detached rollouts.
         contexts = ctx.expand(HORIZON+1, -1, -1).reshape(-1, ctx.shape[-1])
         sf = torch.stack(states).flatten(0, 1)
