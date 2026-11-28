@@ -95,7 +95,7 @@ V7 先以接近、抓取前、抬起、持箱和放置标记阶段，并按参�
 - **Replans** 是平均重规划次数。**E_obj^T** 是末端箱位误差，**E_obj / E_torso** 是执行中箱体与躯干的平均位置跟踪误差，单位为 m。
 - **actRMS** 为相邻控制步关节目标变化率的 RMS（rad/s）。**Stable** 为末端箱体稳定比例（线速度低于 0.1 m/s、角速度低于 0.2 rad/s）。**Contact** 为执行中检测到手箱接触的帧比例。三项是物理代理指标，官方论文的视频自然度评分属于另一套评估。
 
-本地基准评测脚本：`output/official-omnicontact-eval/eval_official_carrybox.py`（外部评测工作区文件）
+[A/B/C 基准评测脚本](../scripts/benchmarks/eval_official_carrybox.py)
 
 ### Bench A · 官方随机尺寸全任务
 
@@ -155,6 +155,6 @@ V7 先以接近、抓取前、抬起、持箱和放置标记阶段，并按参�
 
 ## 8. 实验配置与复查入口
 
-- 推理只加载 actor。运行端维护 10 帧历史，从 CF-Gen 参考选择 11 帧，用当前机器人位姿构造局部参考后调用策略，再将关节目标交给 PD 控制器。仓库提供 `python -m carrywm.export CHECKPOINT ACTOR.pt` 生成独立 TorchScript actor，接口为 `[B,11,122]` 与 `[B,10,141]`，输出 `[B,29]`。导出时与原模型做数值一致性校验。官方基线用各自的 ONNX 和输入适配。基准执行使用 MuJoCo 的实体接触。[Actor 导出](../carrywm/export.py) · 本地仿真评估（`output/official-omnicontact-eval/eval_official_carrybox.py`，外部评测工作区文件）
+- 推理只加载 actor。运行端维护 10 帧历史，从 CF-Gen 参考选择 11 帧，用当前机器人位姿构造局部参考后调用策略，再将关节目标交给 PD 控制器。仓库提供 `python -m carrywm.export CHECKPOINT ACTOR.pt` 生成独立 TorchScript actor，接口为 `[B,11,122]` 与 `[B,10,141]`，输出 `[B,29]`。导出时与原模型做数值一致性校验。官方基线用各自的 ONNX 和输入适配。基准执行使用 MuJoCo 的实体接触。[Actor 导出](../carrywm/export.py) · [MuJoCo 基准评估](../scripts/benchmarks/eval_official_carrybox.py)
 - 代码以 `v7.3-ultra` 的 `bbd5350` 为准，上游训练基线为 `19cde38`。本系列训练入口为 `python -m carrywm.train_v7`。准备官方 sim2sim 资产、`case1_carry` MoCap、V7 生成训练包和固定验证包，按正式实验选择 `--ultra --motion-split all --cfgen-ratio 0.5 --lr-schedule cosine --iterations 30000 --seed 42`，并提供 `--sim-root`、`--motion-dir`、`--cfgen-train-pack`、`--val-pack` 与新的 `--output-dir`。复跑 16k 和 30k 的评测应使用对应检查点，保持每个基准的任务列表和成功判据一致。
 - 本报告的 OOD 表依据提供的 24 条结果行，16k 和 30k 的固定验证、真实转移和时间来自正式运行日志快照。训练机制根据最终提交静态核对。单项改动的独立因果收益需要同种子、同数据和同评估协议的消融。当前结果支持仿真搬箱结论。

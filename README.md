@@ -1,5 +1,89 @@
 # 从 OmniContact 到 v7.3-ultra：搬箱训练、部署与实验结果
 
+[准备环境](#准备环境) · [从零训练 Ultra](#从零训练-ultra) · [默认测试 A/B/C](#默认测试abc) · [实验结果](#7-实验结果)
+
+## 快速复现
+
+### 准备环境
+
+训练使用 Linux、支持 CUDA 的 NVIDIA GPU 和 Python 3.10。正式实验使用 RTX 3090 与 PyTorch 2.7.0 + CUDA 12.8。默认测试使用 CPU MuJoCo。下列命令在仓库根目录运行。
+
+```bash
+git clone https://github.com/Solivaman/OmniContact2SuperMimic.git
+cd OmniContact2SuperMimic
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install numpy scipy pyyaml onnxruntime \
+  mujoco==3.10.0 mujoco-warp==3.10.0.1 warp-lang==1.14.0
+
+git clone https://github.com/Ingrid789/OmniContact_sim2sim.git ../OmniContact_sim2sim
+git -C ../OmniContact_sim2sim checkout 1cf9ddd4067cbe5710b1f475e96f9c69f88055e2
+
+export SIM_ROOT="$(cd ../OmniContact_sim2sim && pwd)"
+export MOTION_DIR="$PWD/assets/data/box/case1_carry"
+export TRAIN_PACK="$PWD/data_packs/official_train_600.npz"
+export VAL_PACK="$PWD/data_packs/official_val_60.npz"
+export RUN_DIR="$PWD/runs/ultra-seed42"
+```
+
+按照官方数据准备说明，把 `case1_carry` 的 `.npz` 解压到 `$MOTION_DIR`（或把变量指向已有数据目录）。默认 A/B/C 测试只使用 `$SIM_ROOT` 中的仿真资产、演示以及训练得到的检查点。[官方资产下载说明](https://github.com/Ingrid789/OmniContact#-data-preparation)
+
+已有检查点且只跑 CPU 测试时，从 PyPI 安装 `torch==2.7.0 numpy scipy pyyaml onnxruntime mujoco==3.10.0` 即可，并按下方测试命令指定检查点。
+
+### 从零训练 Ultra
+
+先做一次离线 CF-Gen 参考生成。训练包含 600 条可用于阶段重置的参考，固定验证包含独立的 60 条参考。[参考包生成脚本](scripts/generate_official_cfgen_packs.py)
+
+```bash
+python -m scripts.generate_official_cfgen_packs \
+  --sim-root "$SIM_ROOT" --output "$TRAIN_PACK" \
+  --n-a 400 --n-b 200 --seed-a 73001 --seed-b 73002 \
+  --workers 12 --compute-valid-mask --require-valid-starts
+
+python -m scripts.generate_official_cfgen_packs \
+  --sim-root "$SIM_ROOT" --output "$VAL_PACK" \
+  --n-a 40 --n-b 20 --seed-a 20261 --seed-b 20262 --workers 12
+```
+
+下面的训练命令使用 seed 42、2048 个物理环境、MoCap 与 CF-Gen 各 50% 的参考来源，并按 30,000 轮做余弦衰减。每 1000 轮运行一次固定 60 局验证。[训练入口](carrywm/train_v7.py)
+
+```bash
+python -u -m carrywm.train_v7 \
+  --sim-root "$SIM_ROOT" --motion-dir "$MOTION_DIR" \
+  --cfgen-train-pack "$TRAIN_PACK" --val-pack "$VAL_PACK" \
+  --output-dir "$RUN_DIR" --device cuda:0 --precision bf16 \
+  --ultra --motion-split all --cfgen-ratio 0.5 \
+  --lr 2e-4 --lr-schedule cosine --iterations 30000 --seed 42 \
+  --eval-every 1000 --eval-workers 12 --recovery-workers 12 \
+  --save-every 50 --full-save-every 200
+```
+
+输出目录里的 `metrics.jsonl` 记录训练及固定验证指标，`latest.pt` 保存最近一份可恢复训练的完整检查点。续训时沿用同一配置和输出目录，追加 `--resume "$RUN_DIR/latest.pt"`。复测表中的 16k 时，训练期间在第 16,000 轮保存完成后，将 `latest.pt` 复制出来单独归档，并在测试时传入该文件。重新以 `--iterations 16000` 开训会改变余弦衰减曲线。
+
+### 默认测试（A/B/C）
+
+下列命令对当前检查点分别使用官方 CF-Gen 和 V7 CF-Gen，依次运行随机尺寸 A（200 局）、30 cm 立方箱 B（100 局）和官方演示 C（13 局）。终端打印汇总，JSON 同时保存两种生成器的逐局结果。评测脚本中的 `v72_*` 是沿用的结果键，实际 actor 由传入的检查点决定。[默认评测脚本](scripts/benchmarks/eval_official_carrybox.py)
+
+```bash
+CHECKPOINT="$RUN_DIR/latest.pt"  # 测 16k 时改为归档的 16000 轮检查点
+PYTHONPATH=. python scripts/benchmarks/eval_official_carrybox.py \
+  --sim-root "$SIM_ROOT" --checkpoint "$CHECKPOINT" \
+  --output "$RUN_DIR/eval-abc.json" --seed 42 --workers 12 \
+  --methods v72_official_cfgen,v72_v7_cfgen --skip-ik
+```
+
+加 `--smoke` 可先试跑 6 局 Bench A。少内存机器可把 `--workers` 调小。若要复测本文的官方基线，在 `--methods` 中再加上 `official_mlp,official_transformer`。官方策略搭配 V7 CF-Gen 的交叉对照使用以下命令。[官方策略交叉评测脚本](scripts/benchmarks/eval_official_on_v7_cfgen.py)
+
+```bash
+PYTHONPATH=. python scripts/benchmarks/eval_official_on_v7_cfgen.py \
+  --sim-root "$SIM_ROOT" --output "$RUN_DIR/eval-official-on-v7-abc.json" \
+  --seed 42 --workers 4
+```
+
+## 方法概览
+
 本文以 OmniContact 的 **Unitree G1 Carry Box** 为范围，对照官方 Isaac Lab 训练代码与官方 MuJoCo sim2sim 代码，说明最终版 `v7.3-ultra`（`bbd535068573d209b7d80e11c88e934edebfca2c`）怎样生成搬箱参考、训练策略、执行恢复，以及在三组 OOD 基准上的表现。[OmniContact 官方训练代码](https://github.com/Ingrid789/OmniContact/tree/19cde38364a5b48e47348b270c895eabe2ba3ad9) · [官方 sim2sim](https://github.com/Ingrid789/OmniContact_sim2sim) · [Ultra 训练入口](carrywm/train_v7.py) · [独立文档](docs/omnicontact-to-v7.3-ultra.md)
 
 **核心改动**是用 MuJoCo Warp 收集真实交互，训练预测机器人、自由箱子和接触的世界模型（WM），再让 actor 在冻结的 WM 中展开 32 步，通过可微回报更新。Contact Flow 仍然用来指定任务。最终 actor 同时读取完整关节参考和未来箱体轨迹，训练从多个动作阶段初始化，使用实体仿真的掉箱状态生成恢复参考。
@@ -95,7 +179,7 @@ V7 先以接近、抓取前、抬起、持箱和放置标记阶段，并按参�
 - **Replans** 是平均重规划次数。**E_obj^T** 是末端箱位误差，**E_obj / E_torso** 是执行中箱体与躯干的平均位置跟踪误差，单位为 m。
 - **actRMS** 为相邻控制步关节目标变化率的 RMS（rad/s）。**Stable** 为末端箱体稳定比例（线速度低于 0.1 m/s、角速度低于 0.2 rad/s）。**Contact** 为执行中检测到手箱接触的帧比例。三项是物理代理指标，官方论文的视频自然度评分属于另一套评估。
 
-本地基准评测脚本：`output/official-omnicontact-eval/eval_official_carrybox.py`（外部评测工作区文件）
+[A/B/C 基准评测脚本](scripts/benchmarks/eval_official_carrybox.py)
 
 ### Bench A · 官方随机尺寸全任务
 
@@ -155,6 +239,6 @@ V7 先以接近、抓取前、抬起、持箱和放置标记阶段，并按参�
 
 ## 8. 实验配置与复查入口
 
-- 推理只加载 actor。运行端维护 10 帧历史，从 CF-Gen 参考选择 11 帧，用当前机器人位姿构造局部参考后调用策略，再将关节目标交给 PD 控制器。仓库提供 `python -m carrywm.export CHECKPOINT ACTOR.pt` 生成独立 TorchScript actor，接口为 `[B,11,122]` 与 `[B,10,141]`，输出 `[B,29]`。导出时与原模型做数值一致性校验。官方基线用各自的 ONNX 和输入适配。基准执行使用 MuJoCo 的实体接触。[Actor 导出](carrywm/export.py) · 本地仿真评估（`output/official-omnicontact-eval/eval_official_carrybox.py`，外部评测工作区文件）
+- 推理只加载 actor。运行端维护 10 帧历史，从 CF-Gen 参考选择 11 帧，用当前机器人位姿构造局部参考后调用策略，再将关节目标交给 PD 控制器。仓库提供 `python -m carrywm.export CHECKPOINT ACTOR.pt` 生成独立 TorchScript actor，接口为 `[B,11,122]` 与 `[B,10,141]`，输出 `[B,29]`。导出时与原模型做数值一致性校验。官方基线用各自的 ONNX 和输入适配。基准执行使用 MuJoCo 的实体接触。[Actor 导出](carrywm/export.py) · [MuJoCo 基准评估](scripts/benchmarks/eval_official_carrybox.py)
 - 代码以 `v7.3-ultra` 的 `bbd5350` 为准，上游训练基线为 `19cde38`。本系列训练入口为 `python -m carrywm.train_v7`。准备官方 sim2sim 资产、`case1_carry` MoCap、V7 生成训练包和固定验证包，按正式实验选择 `--ultra --motion-split all --cfgen-ratio 0.5 --lr-schedule cosine --iterations 30000 --seed 42`，并提供 `--sim-root`、`--motion-dir`、`--cfgen-train-pack`、`--val-pack` 与新的 `--output-dir`。复跑 16k 和 30k 的评测应使用对应检查点，保持每个基准的任务列表和成功判据一致。
 - 本报告的 OOD 表依据提供的 24 条结果行，16k 和 30k 的固定验证、真实转移和时间来自正式运行日志快照。训练机制根据最终提交静态核对。单项改动的独立因果收益需要同种子、同数据和同评估协议的消融。当前结果支持仿真搬箱结论。
